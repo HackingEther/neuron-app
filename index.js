@@ -4,7 +4,6 @@ import crypto from "crypto";
 import { Octokit } from "@octokit/rest";
 import dotenv from "dotenv";
 
-// ⬇️ added: we'll shell out to git/semgrep and manage temp dirs
 import { execSync } from "node:child_process";
 import os from "node:os";
 import fs from "node:fs";
@@ -15,8 +14,7 @@ dotenv.config();
 const app = express();
 const { WEBHOOK_SECRET, GITHUB_TOKEN, PORT = 3000 } = process.env;
 
-// (Optional) help Render/Linux find semgrep if it's installed via pipx
-// You can tweak or remove these, they're safe no-ops on Windows if not present.
+// Make sure semgrep is on PATH in Render/Linux images
 process.env.PATH = [
   process.env.PATH,
   "/opt/render/.cache/pipx/venvs/semgrep/bin",
@@ -28,6 +26,44 @@ process.env.PATH = [
 function verify(sigHeader, raw) {
   const expected = "sha256=" + crypto.createHmac("sha256", WEBHOOK_SECRET).update(raw).digest("hex");
   return sigHeader === expected;
+}
+
+// Safe getter for analyzer output: accept either an array or { findings: [...] }
+function coerceFindingsShape(jsonText) {
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    return [];
+  }
+  if (Array.isArray(parsed)) return parsed;
+  if (parsed && Array.isArray(parsed.findings)) return parsed.findings;
+  // handle raw semgrep.json if someone prints it by mistake
+  if (parsed && Array.isArray(parsed.results)) {
+    return parsed.results.map((r) => ({
+      ruleId: r.check_id,
+      severity: r?.extra?.severity,
+      path: r.path,
+      start: { line: r?.start?.line, col: r?.start?.col },
+      end:   { line: r?.end?.line,   col: r?.end?.col },
+      message: r?.extra?.message,
+      title: r?.extra?.metadata?.shortDescription || r?.extra?.message
+    }));
+  }
+  return [];
+}
+
+// Normalize a single finding into display-friendly fields, tolerating multiple shapes
+function normalizeForSummary(f) {
+  const ruleId = f.rule_id ?? f.ruleId ?? f.id ?? f.check_id ?? "unknown-rule";
+  const severity = f.severity ?? f?.extra?.severity ?? "INFO";
+  const file = f.file ?? f.path ?? f?.location?.file ?? "unknown";
+  const startLine =
+    f.start_line ?? f?.start?.line ?? f?.location?.start?.line ?? null;
+  const title =
+    f.title ?? f.message ?? f?.extra?.message ?? "Issue detected";
+
+  return { ruleId, severity, file, startLine, title };
 }
 
 app.post("/webhook", async (req, res) => {
@@ -60,20 +96,16 @@ app.post("/webhook", async (req, res) => {
       const repoDir = path.join(work, "repo");
 
       try {
-        // shallow clone the PR branch
+        // shallow clone the PR branch (repo can be public; if private, use a PAT in the URL)
         execSync(
           `git clone --depth 1 --branch "${headRef}" "https://github.com/${headRepoFull}.git" repo`,
           { cwd: work, stdio: "inherit" }
         );
 
-        // run semgrep + normalize, capture JSON to stdout
-        // Requires:
-        //  - semgrep.yml at project root
-        //  - analyzers/run-and-normalize.js (wraps semgrep + normalize-findings.js)
+        // Paths to rules and wrapper script (in neuron-app)
         const rulesPath = path.resolve("semgrep.yml");
         const runScript = path.resolve("analyzers", "run-and-normalize.js");
 
-        // sanity check helpful errors
         if (!fs.existsSync(rulesPath)) {
           throw new Error(`Missing semgrep rules at ${rulesPath}. Add a semgrep.yml to repo root.`);
         }
@@ -81,21 +113,27 @@ app.post("/webhook", async (req, res) => {
           throw new Error(`Missing analyzer wrapper at ${runScript}. Create analyzers/run-and-normalize.js.`);
         }
 
+        // Run analyzer wrapper (prints unified JSON to stdout)
         const findingsJson = execSync(
           `node "${runScript}" "${repoDir}" "${rulesPath}"`,
           { encoding: "utf8" }
         );
-        const findings = JSON.parse(findingsJson);
+
+        // Tolerate array OR { findings: [...] }
+        const findingsArr = coerceFindingsShape(findingsJson);
 
         // Build a short PR-level summary
-        const total = findings.length;
-        const top = findings.slice(0, 5).map(f =>
-          `- **${f.severity}** \`${f.rule_id}\` in \`${f.file}\` @ L${f.start_line}\n  ${f.title}`
-        ).join("\n");
+        const total = findingsArr.length;
+        const top = findingsArr.slice(0, 5)
+          .map((fRaw) => {
+            const f = normalizeForSummary(fRaw);
+            return `- **${f.severity}** \`${f.ruleId}\` in \`${f.file}\` @ L${f.startLine}\n  ${f.title}`;
+          })
+          .join("\n");
 
         const body = total === 0
           ? "✅ Neuron: no issues found by Semgrep."
-          : `🧠 **Neuron static checks (Semgrep)**\n\n**${total} finding(s)**:\n\n${top}\n\n_Artifact generated server-side: \`findings.json\`._`;
+          : `🧠 **Neuron static checks (Semgrep)**\n\n**${total} finding(s)**:\n\n${top}\n\n_Artifact generated server-side via Semgrep._`;
 
         await octokit.issues.createComment({ owner, repo, issue_number: prNum, body });
         console.log(`Posted analyzer summary to PR #${prNum} in ${owner}/${repo}`);
