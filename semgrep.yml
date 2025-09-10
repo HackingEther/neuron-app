@@ -1,0 +1,6 @@
+rules:
+  - id: no-eval-demo
+    message: Avoid eval(...) — executes arbitrary code
+    severity: MEDIUM
+    languages: [javascript, typescript]
+    pattern: eval($X)
