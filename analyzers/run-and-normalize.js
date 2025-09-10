@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Run Semgrep, accept exit codes 0 (no findings) and 1 (findings),
- * and print a unified { findings: [...] } JSON to stdout.
+ * ESM version — works with "type":"module".
+ * Accepts Semgrep exit 0/1; fails on >=2; prints { findings: [...] } to stdout.
  * Usage: node analyzers/run-and-normalize.js <repoDir> <rulesPath>
  */
 
@@ -28,44 +28,33 @@ if (!fs.existsSync(rulesPath)) die(`Rules file not found: ${rulesPath}`);
 
 const outFile = path.join(repoDir, "semgrep.json");
 
-// Build args (NOTICE: no --error flag)
+// No "--error" flag. We only want JSON and an output file.
 const semArgs = ["--config", rulesPath, "--json", "--output", outFile, "."];
-
-// Run semgrep in repoDir
 const sem = spawnSync("semgrep", semArgs, { cwd: repoDir, encoding: "utf8" });
 
-// If process failed to start
-if (sem.error) {
-  die(`Failed to start semgrep: ${sem.error.message}`);
-}
+if (sem.error) die(`Failed to start semgrep: ${sem.error.message}`);
 
-// Semgrep exit codes: 0 = no matches, 1 = matches, >=2 = error
+// 0 = no matches, 1 = matches, >=2 = real error
 if (typeof sem.status === "number" && sem.status >= 2) {
   const stderr = (sem.stderr || "").slice(0, 4000);
   die(`Semgrep failed (exit ${sem.status}). stderr:\n${stderr}`);
 }
 
-// Ensure output exists; fallback to stdout if needed
+// Ensure JSON exists (fallback to stdout in older versions)
 if (!fs.existsSync(outFile)) {
   const stdout = sem.stdout || "";
   if (stdout.trim().startsWith("{")) {
-    try {
-      fs.writeFileSync(outFile, stdout, "utf8");
-    } catch (e) {
-      die(`Could not write semgrep.json from stdout: ${e.message}`);
-    }
+    try { fs.writeFileSync(outFile, stdout, "utf8"); }
+    catch (e) { die(`Could not write semgrep.json from stdout: ${e.message}`); }
   } else {
     fs.writeFileSync(outFile, JSON.stringify({ results: [] }), "utf8");
   }
 }
 
-// Normalize Semgrep JSON
+// Normalize to unified shape
 let raw;
-try {
-  raw = JSON.parse(fs.readFileSync(outFile, "utf8"));
-} catch (e) {
-  die(`Could not parse semgrep.json: ${e.message}`);
-}
+try { raw = JSON.parse(fs.readFileSync(outFile, "utf8")); }
+catch (e) { die(`Could not parse semgrep.json: ${e.message}`); }
 
 const results = Array.isArray(raw?.results) ? raw.results : [];
 const findings = results.map((r) => ({
@@ -79,5 +68,4 @@ const findings = results.map((r) => ({
   metadata: r?.extra?.metadata || {},
 }));
 
-// Print unified JSON to stdout for index.js
 process.stdout.write(JSON.stringify({ findings }));
