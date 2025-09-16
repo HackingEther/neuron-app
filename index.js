@@ -14,12 +14,13 @@ dotenv.config();
 const app = express();
 const { WEBHOOK_SECRET, GITHUB_TOKEN, PORT = 3000 } = process.env;
 
-// Ensure Render/Linux can find semgrep
+// (Optional) help Render/Linux find semgrep if it's installed via pipx/venv
 process.env.PATH = [
   process.env.PATH,
   "/opt/render/.cache/pipx/venvs/semgrep/bin",
   `${process.env.HOME || ""}/.local/bin`,
   `${process.env.HOME || ""}/.local/pipx/venvs/semgrep/bin`,
+  "/opt/render/project/src/.venv/bin"
 ].filter(Boolean).join(":");
 
 // Verify webhook HMAC signature
@@ -47,27 +48,31 @@ app.post("/webhook", async (req, res) => {
       const repo = payload.repository.name;
       const prNum = payload.number;
 
-      const headRef = payload.pull_request.head.ref;
-      const headRepoFull = payload.pull_request.head.repo.full_name;
+      const headRef = payload.pull_request.head.ref; // e.g. "feature-branch"
+      const headRepoFull = payload.pull_request.head.repo.full_name; // e.g. "user/repo"
 
       const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
+      // tracer comment so you know the run started
       await octokit.issues.createComment({
         owner,
         repo,
         issue_number: prNum,
-        body: "🔧 Neuron: starting static checks…",
+        body: "🔧 Neuron: starting static checks…"
       });
 
+      // temp workspace
       const work = fs.mkdtempSync(path.join(os.tmpdir(), "neuron-"));
       const repoDir = path.join(work, "repo");
 
       try {
+        // shallow clone the PR branch
         execSync(
           `git clone --depth 1 --branch "${headRef}" "https://github.com/${headRepoFull}.git" repo`,
           { cwd: work, stdio: "inherit" }
         );
 
+        // run semgrep + normalize, capture JSON
         const rulesPath = path.resolve("semgrep.yml");
         const runScript = path.resolve("analyzers", "run-and-normalize.js");
 
@@ -88,8 +93,12 @@ app.post("/webhook", async (req, res) => {
         );
         const findings = JSON.parse(findingsJson);
 
-        const total = findings.length;
-        const top = findings
+        // --- Deliverable 2 tweak: sort + build top-5 summary ---
+        const sevRank = { CRITICAL: 4, HIGH: 3, MEDIUM: 2, LOW: 1 };
+        const sorted = [...findings].sort(
+          (a, b) => (sevRank[b.severity] || 0) - (sevRank[a.severity] || 0)
+        );
+        const top = sorted
           .slice(0, 5)
           .map(
             (f) =>
@@ -98,17 +107,20 @@ app.post("/webhook", async (req, res) => {
           .join("\n");
 
         const body =
-          total === 0
-            ? "✅ Neuron: no issues found by Semgrep."
-            : `🧠 **Neuron static checks (Semgrep)**\n\n**${total} finding(s)**:\n\n${top}\n\n_Artifact generated server-side: \`findings.json\`._`;
+          findings.length === 0
+            ? "✅ Neuron: no issues found by analyzer."
+            : `🧠 **Neuron static checks**\n\n**${findings.length} finding(s)**:\n\n${top}\n\n_Artifact generated server-side: \`findings.json\`._`;
 
         await octokit.issues.createComment({
           owner,
           repo,
           issue_number: prNum,
-          body,
+          body
         });
-        console.log(`Posted analyzer summary to PR #${prNum} in ${owner}/${repo}`);
+
+        console.log(
+          `Posted analyzer summary to PR #${prNum} in ${owner}/${repo}`
+        );
       } catch (e) {
         console.error("Analyzer error:", e);
         await octokit.issues.createComment({
@@ -118,7 +130,7 @@ app.post("/webhook", async (req, res) => {
           body: `⚠️ Neuron: analyzer failed.\n\n\`\`\`\n${String(e).slice(
             0,
             1500
-          )}\n\`\`\``,
+          )}\n\`\`\``
         });
       } finally {
         try {
@@ -134,8 +146,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
+// Simple GET endpoint for health checks
 app.get("/", (_, res) => res.send("Neuron webhook running"));
 
-app.listen(PORT, () =>
-  console.log(`Neuron webhook listening on :${PORT}`)
-);
+app.listen(PORT, () => console.log(`Neuron webhook listening on :${PORT}`));
