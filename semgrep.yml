@@ -1,6 +1,53 @@
 rules:
-  - id: no-eval-demo
-    message: Avoid eval(...) — executes arbitrary code
-    severity: MEDIUM
+  # 0) Keep your existing "no eval" demo rule
+  - id: neuron.demo.no-eval-demo
     languages: [javascript, typescript]
-    pattern: eval($X)
+    message: Avoid eval(...) — executes arbitrary code
+    patterns:
+      - pattern: eval(...)
+    severity: MEDIUM
+    metadata:
+      title: Avoid eval
+      category: security
+
+  # 1) Off-by-one: for (...; i <= arr.length; ...)
+  - id: neuron.demo.off-by-one-loop
+    languages: [javascript, typescript]
+    message: Possible off-by-one: loop uses "<= arr.length". Prefer "i < arr.length".
+    severity: MEDIUM
+    patterns:
+      - pattern: |
+          for (let $I = 0; $I <= $ARR.length; $I++) {
+            ...
+          }
+    metadata:
+      title: Off-by-one loop boundary
+      category: correctness
+
+  # 2) Null/undefined access: variable set to null then dereferenced
+  # (Targeted demo pattern to catch our sample code)
+  - id: neuron.demo.null-deref
+    languages: [javascript, typescript]
+    message: Possible null dereference: variable is set to null earlier and then a property is accessed.
+    severity: HIGH
+    patterns:
+      - pattern: |
+          let $X = null;
+          ...
+          $X.$PROP
+    metadata:
+      title: Null/undefined property access
+      category: correctness
+      note: "This is a narrow demo rule designed to catch our sample. Can be generalized later."
+
+  # 3) Insecure (catastrophic backtracking) regex like /(a+)+$/
+  - id: neuron.demo.insecure-regex
+    languages: [javascript, typescript]
+    message: Potential catastrophic backtracking regex /(a+)+$/. Avoid nested quantifiers on untrusted input.
+    severity: HIGH
+    patterns:
+      - pattern: |
+          const $RE = /(a+)+$/;
+    metadata:
+      title: Insecure regex (nested quantifiers)
+      category: security
