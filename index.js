@@ -14,56 +14,43 @@ dotenv.config();
 const app = express();
 const { WEBHOOK_SECRET, GITHUB_TOKEN, PORT = 3000 } = process.env;
 
-// Make sure semgrep is on PATH in Render/Linux images
+// Help the container find semgrep if installed via pip/pipx
 process.env.PATH = [
   process.env.PATH,
+  "/opt/render/.venv/bin",
   "/opt/render/.cache/pipx/venvs/semgrep/bin",
   `${process.env.HOME || ""}/.local/bin`,
   `${process.env.HOME || ""}/.local/pipx/venvs/semgrep/bin`,
 ].filter(Boolean).join(":");
 
-// Verify webhook HMAC signature (proves request is from GitHub)
+// Verify webhook signature from GitHub
 function verify(sigHeader, raw) {
   const expected = "sha256=" + crypto.createHmac("sha256", WEBHOOK_SECRET).update(raw).digest("hex");
   return sigHeader === expected;
 }
 
-// Safe getter for analyzer output: accept either an array or { findings: [...] }
-function coerceFindingsShape(jsonText) {
-  let parsed;
-  try {
-    parsed = JSON.parse(jsonText);
-  } catch {
-    return [];
-  }
-  if (Array.isArray(parsed)) return parsed;
-  if (parsed && Array.isArray(parsed.findings)) return parsed.findings;
-  // handle raw semgrep.json if someone prints it by mistake
-  if (parsed && Array.isArray(parsed.results)) {
-    return parsed.results.map((r) => ({
-      ruleId: r.check_id,
-      severity: r?.extra?.severity,
-      path: r.path,
-      start: { line: r?.start?.line, col: r?.start?.col },
-      end:   { line: r?.end?.line,   col: r?.end?.col },
-      message: r?.extra?.message,
-      title: r?.extra?.metadata?.shortDescription || r?.extra?.message
-    }));
-  }
-  return [];
-}
+// Prefer project rules, fall back to service defaults
+function discoverRules(repoDir) {
+  const repoRulesDir = path.join(repoDir, ".neuron", "rules");
+  const repoSemgrep = path.join(repoDir, "semgrep.yml");
+  const serviceDefault = path.resolve("rules", "default.yml");
 
-// Normalize a single finding into display-friendly fields, tolerating multiple shapes
-function normalizeForSummary(f) {
-  const ruleId = f.rule_id ?? f.ruleId ?? f.id ?? f.check_id ?? "unknown-rule";
-  const severity = f.severity ?? f?.extra?.severity ?? "INFO";
-  const file = f.file ?? f.path ?? f?.location?.file ?? "unknown";
-  const startLine =
-    f.start_line ?? f?.start?.line ?? f?.location?.start?.line ?? null;
-  const title =
-    f.title ?? f.message ?? f?.extra?.message ?? "Issue detected";
-
-  return { ruleId, severity, file, startLine, title };
+  if (fs.existsSync(repoRulesDir)) {
+    const files = fs.readdirSync(repoRulesDir)
+      .filter(f => f.endsWith(".yml") || f.endsWith(".yaml"))
+      .sort();
+    if (files.length) {
+      const chosen = path.join(repoRulesDir, files[0]);
+      return { chosen, source: ".neuron/rules/*" };
+    }
+  }
+  if (fs.existsSync(repoSemgrep)) {
+    return { chosen: repoSemgrep, source: "repo/semgrep.yml" };
+  }
+  if (fs.existsSync(serviceDefault)) {
+    return { chosen: serviceDefault, source: "service rules/default.yml" };
+  }
+  return { chosen: null, source: "none" };
 }
 
 app.post("/webhook", async (req, res) => {
@@ -80,60 +67,61 @@ app.post("/webhook", async (req, res) => {
       const repo  = payload.repository.name;
       const prNum = payload.number;
 
-      const headRef = payload.pull_request.head.ref;                 // e.g. "test-branch"
-      const headRepoFull = payload.pull_request.head.repo.full_name; // e.g. "HackingEther/neuron-demo"
+      const headRef = payload.pull_request.head.ref;
+      const headRepoFull = payload.pull_request.head.repo.full_name;
 
       const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
-      // tracer comment so you know the run started
       await octokit.issues.createComment({
         owner, repo, issue_number: prNum,
         body: "🔧 Neuron: starting static checks…"
       });
 
-      // temp workspace
       const work = fs.mkdtempSync(path.join(os.tmpdir(), "neuron-"));
       const repoDir = path.join(work, "repo");
 
       try {
-        // shallow clone the PR branch (repo can be public; if private, use a PAT in the URL)
         execSync(
           `git clone --depth 1 --branch "${headRef}" "https://github.com/${headRepoFull}.git" repo`,
           { cwd: work, stdio: "inherit" }
         );
 
-        // Paths to rules and wrapper script (in neuron-app)
-        const rulesPath = path.resolve("semgrep.yml");
-        const runScript = path.resolve("analyzers", "run-and-normalize.js");
-
-        if (!fs.existsSync(rulesPath)) {
-          throw new Error(`Missing semgrep rules at ${rulesPath}. Add a semgrep.yml to repo root.`);
+        const { chosen: rulesPath, source } = discoverRules(repoDir);
+        if (!rulesPath) {
+          throw new Error(`No rules found (looked for .neuron/rules/*.yml, repo/semgrep.yml, and service rules/default.yml).`);
         }
+        console.log(`Using rules: ${rulesPath} (source: ${source})`);
+
+        const runScript = path.resolve("analyzers", "run-and-normalize.js");
         if (!fs.existsSync(runScript)) {
           throw new Error(`Missing analyzer wrapper at ${runScript}. Create analyzers/run-and-normalize.js.`);
         }
 
-        // Run analyzer wrapper (prints unified JSON to stdout)
         const findingsJson = execSync(
           `node "${runScript}" "${repoDir}" "${rulesPath}"`,
           { encoding: "utf8" }
         );
 
-        // Tolerate array OR { findings: [...] }
-        const findingsArr = coerceFindingsShape(findingsJson);
+        let findings = [];
+        try {
+          findings = JSON.parse(findingsJson);
+        } catch (err) {
+          throw new Error(`Analyzer did not return valid JSON: ${err}\nRaw:\n${findingsJson.slice(0, 1000)}`);
+        }
 
-        // Build a short PR-level summary
-        const total = findingsArr.length;
-        const top = findingsArr.slice(0, 5)
-          .map((fRaw) => {
-            const f = normalizeForSummary(fRaw);
-            return `- **${f.severity}** \`${f.ruleId}\` in \`${f.file}\` @ L${f.startLine}\n  ${f.title}`;
-          })
-          .join("\n");
+        const total = Array.isArray(findings) ? findings.length : 0;
+        const top = (Array.isArray(findings) ? findings : []).slice(0, 5).map(f =>
+          `- **${f.severity}** \`${f.rule_id}\` in \`${f.file}\` @ L${f.start_line}\n  ${f.title}`
+        ).join("\n");
+
+        const relToRepo = path.relative(repoDir, rulesPath);
+        const relDisplay = relToRepo.startsWith("..")
+          ? path.relative(process.cwd(), rulesPath)
+          : relToRepo;
 
         const body = total === 0
-          ? "✅ Neuron: no issues found by Semgrep."
-          : `🧠 **Neuron static checks (Semgrep)**\n\n**${total} finding(s)**:\n\n${top}\n\n_Artifact generated server-side via Semgrep._`;
+          ? `✅ Neuron: no issues found by Semgrep.\n\nRuleset: \`${relDisplay}\` (${source}).`
+          : `🧠 **Neuron static checks (Semgrep)**\n\n**${total} finding(s)**:\n\n${top}\n\nRuleset: \`${relDisplay}\` (${source}).\n_Artifact: unified \`findings.json\` generated server-side._`;
 
         await octokit.issues.createComment({ owner, repo, issue_number: prNum, body });
         console.log(`Posted analyzer summary to PR #${prNum} in ${owner}/${repo}`);
@@ -144,7 +132,6 @@ app.post("/webhook", async (req, res) => {
           body: `⚠️ Neuron: analyzer failed.\n\n\`\`\`\n${String(e).slice(0, 1500)}\n\`\`\``
         });
       } finally {
-        // clean up temp directory
         try { fs.rmSync(work, { recursive: true, force: true }); } catch {}
       }
     }
@@ -156,7 +143,6 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// Simple GET endpoint for health checks
 app.get("/", (_, res) => res.send("Neuron webhook running"));
 
 app.listen(PORT, () => console.log(`Neuron webhook listening on :${PORT}`));
