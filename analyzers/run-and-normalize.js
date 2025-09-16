@@ -1,73 +1,99 @@
 // analyzers/run-and-normalize.js
+// ESM module. Runs Semgrep, then normalizes results to unified schema and prints to stdout.
+
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { normalizeSemgrepJson } from "./normalize-findings.js";
 
-const repoDir   = process.argv[2];
-const rulesPath = process.argv[3];
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-function run(cmd, opts = {}) {
-  return execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...opts });
-}
-
-let semgrepBin = "semgrep";
-let semgrepVersion = "(version check failed)";
-try { semgrepBin = run("which semgrep").trim(); } catch {}
-try { semgrepVersion = run(`${semgrepBin} --version`).trim(); } catch {}
-
-const dirtyEnv = { ...process.env };
-const cleanEnv = { ...process.env };
-for (const k of Object.keys(dirtyEnv)) if (/^SEMGREP_/i.test(k)) delete cleanEnv[k];
-cleanEnv.SEMGREP_SEND_TELEMETRY = "0";
-cleanEnv.SEMGREP_ENABLE_VERSION_CHECK = "0";
-
-// IMPORTANT: no --error (that flag forces non-zero exit when findings exist)
-const cmd = `${semgrepBin} scan --config "${rulesPath}" --json .`;
-
-console.error("🔎 run-and-normalize diagnostics");
-console.error(" repoDir:", repoDir);
-console.error(" rulesPath:", rulesPath);
-console.error(" semgrepBin:", semgrepBin);
-console.error(" semgrepVersion:", semgrepVersion);
-console.error(" removed SEMGREP_* keys:", Object.keys(dirtyEnv).filter(k => /^SEMGREP_/i.test(k)));
-console.error(" finalCmd:", cmd);
-
-function parseSemgrepJson(text) {
-  try { return JSON.parse(text); }
+function which(cmd) {
+  try { return execSync(`which ${cmd}`, { encoding: "utf8" }).trim(); }
   catch { return null; }
 }
 
-let rawJsonText = null;
-try {
-  rawJsonText = execSync(cmd, { cwd: repoDir, encoding: "utf8", env: cleanEnv });
-} catch (e) {
-  // Semgrep might exit non-zero but still print full JSON to stdout; try to use it.
-  const stdout = e && e.stdout ? String(e.stdout) : "";
-  const parsed = parseSemgrepJson(stdout);
-  if (parsed) {
-    rawJsonText = stdout;
-  } else {
-    console.error("❌ semgrep execution failed.");
-    console.error("stderr:", e.stderr ? String(e.stderr) : "(no stderr)");
-    console.error("stdout (non-JSON):", stdout.slice(0, 2000));
-    throw e;
-  }
+function getSemgrepBin() {
+  // Prefer explicit env, then venv path (Render), then PATH
+  const hints = [
+    process.env.SEMGREP_BIN,
+    path.join(process.cwd(), ".venv/bin/semgrep"),
+    "/opt/render/project/src/.venv/bin/semgrep",
+    which("semgrep")
+  ].filter(Boolean);
+  return hints.find(p => {
+    try { return fs.existsSync(p); } catch { return false; }
+  }) || "semgrep";
 }
 
-// Optional: drop the raw semgrep output in the repo temp dir for inspection
-try { fs.writeFileSync(path.join(repoDir, "semgrep.json"), rawJsonText, "utf8"); } catch {}
+function readJsonSafe(p) {
+  const raw = fs.readFileSync(p, "utf8");
+  return JSON.parse(raw);
+}
 
-const raw = parseSemgrepJson(rawJsonText) || { results: [] };
-const normalized = (raw.results || []).map(r => ({
-  tool: "semgrep",
-  rule_id: r.check_id,
-  severity: r.extra?.severity || "INFO",
-  file: r.path,
-  start_line: r.start?.line,
-  end_line: r.end?.line,
-  title: r.extra?.message || "No message provided",
-  metadata: r.extra || {},
-}));
+function logDiag(diag) {
+  // minimal, non-noisy diagnostics (printed to stderr)
+  console.error("🔎 run-and-normalize diagnostics");
+  Object.entries(diag).forEach(([k, v]) => console.error(` ${k}: ${v}`));
+}
 
-// Emit normalized results on stdout for index.js
-console.log(JSON.stringify(normalized, null, 2));
+async function main() {
+  const repoDir = process.argv[2];
+  const rulesPath = process.argv[3];
+
+  if (!repoDir || !rulesPath) {
+    console.error("Usage: node analyzers/run-and-normalize.js <repoDir> <rulesPath>");
+    process.exit(2);
+  }
+
+  const semgrepBin = getSemgrepBin();
+  let semgrepVersion = "unknown";
+  try {
+    semgrepVersion = execSync(`${semgrepBin} --version`, { encoding: "utf8" }).trim();
+  } catch {}
+
+  const cmd = `${semgrepBin} scan --config "${rulesPath}" --json --error .`;
+
+  logDiag({
+    repoDir,
+    rulesPath,
+    semgrepBin,
+    semgrepVersion,
+    removedEnvKeys: Object.keys(process.env).filter(k => k.startsWith("SEMGREP_")).length
+  });
+
+  // Run Semgrep in the repo
+  let semgrepJsonObj;
+  try {
+    const stdout = execSync(cmd, { cwd: repoDir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    // If semgrep printed JSON, parse from stdout
+    semgrepJsonObj = JSON.parse(stdout);
+  } catch (e) {
+    // Sometimes semgrep writes JSON to stdout but still exits non-zero (rare).
+    // Try to parse whatever we captured; otherwise bubble the error.
+    const out = e?.stdout?.toString?.() || "";
+    if (out.trim().startsWith("{")) {
+      try {
+        semgrepJsonObj = JSON.parse(out);
+      } catch {
+        console.error("❌ semgrep execution failed.");
+        throw e;
+      }
+    } else {
+      console.error("❌ semgrep execution failed.");
+      throw e;
+    }
+  }
+
+  const normalized = normalizeSemgrepJson(semgrepJsonObj);
+
+  // Print ONLY normalized array to stdout (index.js consumes this)
+  process.stdout.write(JSON.stringify(normalized));
+}
+
+main().catch((e) => {
+  console.error(e?.stack || String(e));
+  process.exit(1);
+});
