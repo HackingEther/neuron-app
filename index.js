@@ -1,5 +1,3 @@
-// index.js — Neuron webhook + static analyzer + LLM test-plan generator (mockable)
-
 import express from "express";
 import getRawBody from "raw-body";
 import crypto from "crypto";
@@ -11,6 +9,9 @@ import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 
+// --- Azure OpenAI (Foundry) ---
+import { OpenAIClient, AzureKeyCredential } from "@azure/openai";
+
 dotenv.config();
 
 const app = express();
@@ -19,200 +20,102 @@ const {
   GITHUB_TOKEN,
   PORT = 3000,
 
-  // LLM toggles — leave USE_AZURE_OPENAI=false to use the deterministic mock
-  USE_AZURE_OPENAI = "false",
+  // Azure OpenAI bits (set these in Render)
   AZURE_OPENAI_ENDPOINT,
-  AZURE_OPENAI_DEPLOYMENT,
-  AZURE_OPENAI_API_KEY
+  AZURE_OPENAI_KEY,
+  AZURE_OPENAI_DEPLOYMENT,      // e.g. "neuron-llm"
+  AZURE_OPENAI_API_VERSION = "2024-02-01"
 } = process.env;
 
-// Help Render/Linux find semgrep if it's inside a venv
+// Prepare Azure client if configured
+let aoaiClient = null;
+if (AZURE_OPENAI_ENDPOINT && AZURE_OPENAI_KEY) {
+  try {
+    aoaiClient = new OpenAIClient(
+      AZURE_OPENAI_ENDPOINT,
+      new AzureKeyCredential(AZURE_OPENAI_KEY),
+      { apiVersion: AZURE_OPENAI_API_VERSION }
+    );
+  } catch (e) {
+    console.error("Failed to construct Azure OpenAI client:", e);
+  }
+}
+
+// (Optional) help Render/Linux find semgrep if it's installed via pipx
 process.env.PATH = [
   process.env.PATH,
   "/opt/render/.cache/pipx/venvs/semgrep/bin",
-  "/opt/render/project/src/.venv/bin",
   `${process.env.HOME || ""}/.local/bin`,
-  `${process.env.HOME || ""}/.local/pipx/venvs/semgrep/bin`
-]
-  .filter(Boolean)
-  .join(":");
+  `${process.env.HOME || ""}/.local/pipx/venvs/semgrep/bin`,
+].filter(Boolean).join(":");
 
-// ---------- Webhook signature ----------
+// Verify webhook HMAC signature (proves request is from GitHub)
 function verify(sigHeader, raw) {
-  const expected =
-    "sha256=" + crypto.createHmac("sha256", WEBHOOK_SECRET).update(raw).digest("hex");
+  const expected = "sha256=" + crypto.createHmac("sha256", WEBHOOK_SECRET).update(raw).digest("hex");
   return sigHeader === expected;
 }
 
-// ---------- Utilities ----------
-function sortFindings(findings) {
-  const sevRank = { CRITICAL: 4, HIGH: 3, MEDIUM: 2, LOW: 1 };
-  return [...(Array.isArray(findings) ? findings : [])].sort(
-    (a, b) => (sevRank[b.severity] || 0) - (sevRank[a.severity] || 0)
-  );
+// Utility: get list of changed files (quick summary for LLM)
+function extractChangedFiles(payload) {
+  const pr = payload.pull_request;
+  const files = [];
+  // We don’t have the full file list in this payload;
+  // include head/base refs for context instead.
+  files.push(`base: ${pr.base.ref} @ ${pr.base.sha.slice(0,7)}`);
+  files.push(`head: ${pr.head.ref} @ ${pr.head.sha.slice(0,7)}`);
+  return files;
 }
 
-function formatSummary(findings, cap = 5) {
-  const sorted = sortFindings(findings);
-  const top = sorted.slice(0, cap);
-  if (top.length === 0) return "✅ Neuron: no issues found by analyzer.";
-  const lines = top
-    .map(
-      (f) =>
-        `- **${f.severity || "UNK"}** \`${f.rule_id || "rule"}\` in \`${f.file || "?"}\` @ L${
-          f.start_line ?? "?"
-        }\n  ${f.title || f.message || ""}`
-    )
-    .join("\n");
-  return `🧠 **Neuron static checks**\n\n**${findings.length} finding(s)**:\n\n${lines}\n\n_Artifact generated server-side: \`findings.json\`._`;
-}
+// Utility: call Azure OpenAI to produce a short “Neuron Test Plan”
+async function generateTestPlan({ repoFull, prNum, files, findings }) {
+  // Build a compact context for the model
+  const findingsBullets = (findings || []).slice(0, 5).map(f =>
+    `• [${f.severity}] ${f.rule_id} in ${f.file}:L${f.start_line} — ${f.title}`
+  ).join("\n");
 
-// Fetch PR file list + patches (diff hunks)
-async function fetchPrFiles(octokit, owner, repo, prNum) {
-  const files = await octokit.pulls.listFiles({ owner, repo, pull_number: prNum, per_page: 100 });
-  return files.data.map((f) => ({
-    filename: f.filename,
-    status: f.status,
-    patch: f.patch || "",
-    additions: f.additions,
-    deletions: f.deletions,
-    changes: f.changes
-  }));
-}
+  const sys = [
+    "You are Neuron, a senior QA engineer.",
+    "You generate concise test plans tailored to a PR.",
+    "Focus on business-risk coverage, not generic unit tests.",
+    "Output 3–5 bullet points. Prefer plain steps and expected checks.",
+  ].join(" ");
 
-// ---------- LLM providers ----------
-
-// Deterministic mock LLM: turns findings+diffs into a small test plan
-function mockGenerateTestPlan({ repoFullName, prNumber, baseRef, headRef, files, findings }) {
-  const header = `# Neuron Test Plan\n\n**Repo:** ${repoFullName}\n**PR:** #${prNumber} (${headRef} → ${baseRef})\n\n`;
-  const hasFindings = Array.isArray(findings) && findings.length > 0;
-
-  const bulletsFromFindings = (findings || []).slice(0, 5).map((f, i) => {
-    const file = f.file || "unknown file";
-    const line = f.start_line ?? "?";
-    const hint =
-      f.rule_id?.includes("regex") || f.title?.toLowerCase().includes("regex")
-        ? "Include very long, repetitive inputs to probe catastrophic backtracking."
-        : f.rule_id?.includes("off-by-one") || /off[- ]?by[- ]?one/i.test(f.title || "")
-        ? "Add tests for empty arrays and single-element arrays."
-        : f.rule_id?.includes("null") || /null|undefined/i.test(f.title || "")
-        ? "Add tests where inputs are null/undefined and ensure guards/optional chaining are present."
-        : "Add boundary and adversarial cases informed by this finding.";
-    return `- [ ] **${f.rule_id || f.title || "Analyzer finding"}** in \`${file}\` (L${line}) → ${hint}`;
-  });
-
-  // If no findings, derive generic tests from changed files
-  const genericTests =
-    files && files.length > 0
-      ? files.slice(0, 5).map((f) => {
-          const name = f.filename;
-          const isJs = name.endsWith(".js") || name.endsWith(".ts");
-          const suggestion = isJs
-            ? "Add happy-path + error-path unit tests; include null/empty inputs and large inputs."
-            : "Add a simple unit/integration test covering the change.";
-          return `- [ ] \`${name}\`: ${suggestion}`;
-        })
-      : ["- [ ] Touch a file so CI picks up at least one changed path."];
-
-  const outline = [
-    "## Suggested Tests",
-    ...(hasFindings ? bulletsFromFindings : genericTests),
-    "",
-    "## Notes",
-    "- This plan is mock-generated (no external LLM).",
-    "- When Azure OpenAI is enabled, these bullets will be refined with natural-language reasoning and repository context."
+  const user = [
+    `Repository: ${repoFull}`,
+    `PR #${prNum}`,
+    `Changed refs:\n${files.map(f => `- ${f}`).join("\n")}`,
+    findings && findings.length ? `\nStatic findings:\n${findingsBullets}` : "\nStatic findings: none",
+    "\nProduce a short 'Neuron Test Plan' with 3–5 bullets. Keep it under 120 words."
   ].join("\n");
 
-  return header + outline + "\n";
-}
-
-// (Optional) Azure OpenAI provider — stubbed wiring point
-async function azureGenerateTestPlan(input) {
-  // Guard: ensure creds exist
-  if (!AZURE_OPENAI_ENDPOINT || !AZURE_OPENAI_DEPLOYMENT || !AZURE_OPENAI_API_KEY) {
-    throw new Error("Azure OpenAI env vars missing; cannot call provider.");
+  if (!aoaiClient || !AZURE_OPENAI_DEPLOYMENT) {
+    // Fallback text if Azure isn’t configured fully
+    return {
+      ok: false,
+      text: "ℹ️ LLM not configured (missing endpoint/key/deployment). Skipping test plan.",
+    };
   }
-  // Minimal example with fetch (keep as placeholder; real prompt engineering later)
-  const prompt = `
-You are Neuron, an AI code reviewer. Create a concise test plan (3–6 bullets)
-for the following PR context and analyzer findings. Prefer business-aware tests.
 
-PR files (filename + patch snippet):
-${(input.files || [])
-  .slice(0, 5)
-  .map((f) => `- ${f.filename}\n${f.patch?.slice(0, 600) || ""}`)
-  .join("\n")}
-
-Findings (JSON):
-${JSON.stringify(input.findings || []).slice(0, 4000)}
-`.trim();
-
-  // NOTE: This is a placeholder; Azure's exact REST shape varies by API version.
-  // You can replace with @azure/openai SDK if you prefer.
-  const resp = await fetch(
-    `${AZURE_OPENAI_ENDPOINT}/openai/deployments/${AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version=2024-02-15-preview`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "api-key": AZURE_OPENAI_API_KEY
-      },
-      body: JSON.stringify({
-        messages: [
-          { role: "system", content: "You are a precise, terse test planner for PRs." },
-          { role: "user", content: prompt }
-        ],
-        temperature: 0.2
-      })
-    }
-  );
-
-  if (!resp.ok) {
-    const txt = await resp.text();
-    throw new Error(`Azure OpenAI error ${resp.status}: ${txt}`);
-  }
-  const data = await resp.json();
-  const text =
-    data?.choices?.[0]?.message?.content?.trim() ||
-    "# Neuron Test Plan\n\n(Provider returned no content.)\n";
-  // Ensure a header for consistency
-  return text.startsWith("# Neuron") ? text : `# Neuron Test Plan\n\n${text}`;
-}
-
-// Upsert a file in the PR head branch
-async function upsertFileInBranch(octokit, { owner, repo, branch, pathInRepo, content, message }) {
-  // Get current file SHA if it exists
-  let sha;
   try {
-    const existing = await octokit.repos.getContent({
-      owner,
-      repo,
-      path: pathInRepo,
-      ref: branch
-    });
-    // Only set sha if file actually exists (not a directory)
-    if (Array.isArray(existing.data)) {
-      throw new Error(`${pathInRepo} is a directory, expected a file`);
+    const resp = await aoaiClient.getChatCompletions(
+      AZURE_OPENAI_DEPLOYMENT,
+      [
+        { role: "system", content: sys },
+        { role: "user", content: user }
+      ],
+      { temperature: 0.2, maxTokens: 220 }
+    );
+    const choice = resp?.choices?.[0]?.message?.content?.trim();
+    if (choice) {
+      return { ok: true, text: choice };
     }
-    sha = existing.data.sha;
+    return { ok: false, text: "LLM returned no content." };
   } catch (e) {
-    // 404 → create new file
-    sha = undefined;
+    console.error("Azure OpenAI call failed:", e?.message || e);
+    return { ok: false, text: `LLM error: ${String(e).slice(0, 300)}` };
   }
-
-  const res = await octokit.repos.createOrUpdateFileContents({
-    owner,
-    repo,
-    path: pathInRepo,
-    message,
-    content: Buffer.from(content, "utf8").toString("base64"),
-    branch,
-    sha
-  });
-  return res.status;
 }
 
-// ---------- Webhook ----------
 app.post("/webhook", async (req, res) => {
   try {
     const raw = await getRawBody(req);
@@ -224,141 +127,101 @@ app.post("/webhook", async (req, res) => {
 
     if (event === "pull_request" && ["opened", "synchronize", "reopened"].includes(payload.action)) {
       const owner = payload.repository.owner.login;
-      const repo = payload.repository.name;
+      const repo  = payload.repository.name;
+      const repoFull = payload.repository.full_name;
       const prNum = payload.number;
-      const baseRef = payload.pull_request.base.ref;
-      const headRef = payload.pull_request.head.ref;
-      const headRepoFull = payload.pull_request.head.repo.full_name; // e.g. user/repo
+
+      const headRef = payload.pull_request.head.ref;                 // e.g. "test-branch"
+      const headRepoFull = payload.pull_request.head.repo.full_name; // e.g. "HackingEther/neuron-demo"
 
       const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
+      // tracer comment so you know the run started
       await octokit.issues.createComment({
-        owner,
-        repo,
-        issue_number: prNum,
+        owner, repo, issue_number: prNum,
         body: "🔧 Neuron: starting static checks…"
       });
 
-      // Workspace
+      // temp workspace
       const work = fs.mkdtempSync(path.join(os.tmpdir(), "neuron-"));
       const repoDir = path.join(work, "repo");
 
       let findings = [];
       try {
-        // Clone the PR HEAD
+        // shallow clone the PR branch
         execSync(
           `git clone --depth 1 --branch "${headRef}" "https://github.com/${headRepoFull}.git" repo`,
           { cwd: work, stdio: "inherit" }
         );
 
-        // Determine rules path: prefer repo's own semgrep.yml; fallback to server copy if present
+        // prefer repo-level semgrep.yml if present, else fallback to our server copy
         const repoRules = path.join(repoDir, "semgrep.yml");
         const serverRules = path.resolve("semgrep.yml");
-        const rulesPath = fs.existsSync(repoRules)
-          ? repoRules
-          : fs.existsSync(serverRules)
-          ? serverRules
-          : null;
+        const rulesPath = fs.existsSync(repoRules) ? repoRules : serverRules;
 
-        if (!rulesPath) {
-          throw new Error(
-            `No semgrep.yml found in PR repo or server. Add one to the repo root or to server root.`
-          );
-        }
-
-        // Analyzer wrapper
-        const runScriptRepo = path.join(repoDir, "analyzers", "run-and-normalize.js");
-        const runScriptServer = path.resolve("analyzers", "run-and-normalize.js");
-        const runScript = fs.existsSync(runScriptRepo) ? runScriptRepo : runScriptServer;
-
+        // analyzer wrapper
+        const runScript = path.resolve("analyzers", "run-and-normalize.js");
         if (!fs.existsSync(runScript)) {
-          throw new Error(
-            `Missing analyzer wrapper at ${runScript}. Ensure analyzers/run-and-normalize.js exists.`
-          );
+          throw new Error(`Missing analyzer wrapper at ${runScript}. Create analyzers/run-and-normalize.js.`);
+        }
+        if (!fs.existsSync(rulesPath)) {
+          throw new Error(`Missing semgrep rules at ${rulesPath}. Add a semgrep.yml to repo or server root.`);
         }
 
-        // Run analyzer
-        const findingsJson = execSync(`node "${runScript}" "${repoDir}" "${rulesPath}"`, {
-          encoding: "utf8"
-        });
-        findings = JSON.parse(findingsJson);
+        // run semgrep and normalize to canonical findings[]
+        const findingsJson = execSync(
+          `node "${runScript}" "${repoDir}" "${rulesPath}"`,
+          { encoding: "utf8" }
+        );
+        const parsed = JSON.parse(findingsJson);
+        findings = Array.isArray(parsed) ? parsed : [];
 
-        // Post analyzer summary (top-5)
-        const summary = formatSummary(findings, 5);
-        await octokit.issues.createComment({ owner, repo, issue_number: prNum, body: summary });
+        // Build a short PR-level summary
+        const total = findings.length;
+        const top = findings.slice(0, 5).map(f =>
+          `- **${f.severity}** \`${f.rule_id}\` in \`${f.file}\` @ L${f.start_line}\n  ${f.title}`
+        ).join("\n");
 
-        // ====== LLM TEST PLAN STAGE ======
-        // Gather PR file diffs for context
-        const files = await fetchPrFiles(octokit, owner, repo, prNum);
+        const staticBody = total === 0
+          ? "✅ Neuron: no issues found by Semgrep."
+          : `🧠 **Neuron static checks (Semgrep)**\n\n**${total} finding(s)**:\n\n${top}\n\n_Artifact generated server-side: \`findings.json\`._`;
 
-        // Choose provider
-        const useAzure = USE_AZURE_OPENAI.toLowerCase() === "true";
-        let testPlanMd;
-        try {
-          if (useAzure) {
-            testPlanMd = await azureGenerateTestPlan({
-              repoFullName: `${owner}/${repo}`,
-              prNumber: prNum,
-              baseRef,
-              headRef,
-              files,
-              findings
-            });
-          } else {
-            testPlanMd = mockGenerateTestPlan({
-              repoFullName: `${owner}/${repo}`,
-              prNumber: prNum,
-              baseRef,
-              headRef,
-              files,
-              findings
-            });
-          }
-        } catch (llmErr) {
-          // Fall back to mock if Azure fails
-          console.error("LLM provider failed, falling back to mock:", llmErr);
-          testPlanMd =
-            mockGenerateTestPlan({
-              repoFullName: `${owner}/${repo}`,
-              prNumber: prNum,
-              baseRef,
-              headRef,
-              files,
-              findings
-            }) + `\n> Provider error: ${String(llmErr).slice(0, 400)}\n`;
-        }
-
-        // Upsert NEURON_TEST_PLAN.md in PR head branch
-        await upsertFileInBranch(octokit, {
-          owner,
-          repo,
-          branch: headRef,
-          pathInRepo: "NEURON_TEST_PLAN.md",
-          content: testPlanMd,
-          message: "chore(neuron): update NEURON_TEST_PLAN.md from webhook"
-        });
-
-        // Also post as a PR comment (handy for demo)
-        await octokit.issues.createComment({
-          owner,
-          repo,
-          issue_number: prNum,
-          body: `🧪 **Neuron Test Plan (auto-generated)**\n\n${testPlanMd}`
-        });
-
-        console.log(`Posted analyzer summary + test plan to PR #${prNum} (${owner}/${repo})`);
+        await octokit.issues.createComment({ owner, repo, issue_number: prNum, body: staticBody });
+        console.log(`Posted analyzer summary to PR #${prNum} in ${owner}/${repo}`);
       } catch (e) {
-        console.error("Analyzer/LLM error:", e);
+        console.error("Analyzer error:", e);
         await octokit.issues.createComment({
-          owner,
-          repo,
-          issue_number: prNum,
-          body: `⚠️ Neuron: analyzer/LLM stage failed.\n\n\`\`\`\n${String(e).slice(0, 1500)}\n\`\`\``
+          owner, repo, issue_number: prNum,
+          body: `⚠️ Neuron: analyzer failed.\n\n\`\`\`\n${String(e).slice(0, 1500)}\n\`\`\``
         });
       } finally {
-        try {
-          fs.rmSync(work, { recursive: true, force: true });
-        } catch {}
+        try { fs.rmSync(work, { recursive: true, force: true }); } catch {}
+      }
+
+      // --- LLM: Neuron Test Plan ---
+      try {
+        const files = extractChangedFiles(payload);
+        const plan = await generateTestPlan({
+          repoFull,
+          prNum,
+          files,
+          findings
+        });
+
+        const llmComment = plan.ok
+          ? `🧪 **Neuron Test Plan (LLM)**\n\n${plan.text}`
+          : `ℹ️ **Neuron LLM step**\n\n${plan.text}`;
+
+        await octokit.issues.createComment({
+          owner, repo, issue_number: prNum, body: llmComment
+        });
+        console.log("Posted LLM test plan");
+      } catch (e) {
+        console.error("LLM step failed:", e);
+        await octokit.issues.createComment({
+          owner, repo, issue_number: prNum,
+          body: `⚠️ Neuron: LLM step failed.\n\n\`\`\`\n${String(e).slice(0, 800)}\n\`\`\``
+        });
       }
     }
 
@@ -369,7 +232,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// Health check
+// Simple GET endpoint for health checks
 app.get("/", (_, res) => res.send("Neuron webhook running"));
 
 app.listen(PORT, () => console.log(`Neuron webhook listening on :${PORT}`));
