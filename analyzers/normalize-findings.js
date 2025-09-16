@@ -1,54 +1,74 @@
-import fs from "fs";
-import path from "path";
+// analyzers/normalize-findings.js
+// ESM module (Node 22). Converts Semgrep's JSON to Neuron's unified schema.
 
-function mapSemgrep(sem) {
-  const out = [];
-  const results = sem?.results || [];
-  for (const r of results) {
-    const file =
-      r.path || r?.location?.path || r?.extra?.path || "unknown";
-    const start =
-      r.start?.line ??
-      r.extra?.location?.start?.line ??
-      r?.start?.line ??
-      1;
-    const end =
-      r.end?.line ??
-      r.extra?.location?.end?.line ??
-      start;
-    const ruleId = r.check_id || r.rule_id || "unknown";
-    const sev = String(r.extra?.severity || "info").toUpperCase();
-    const msg = r.extra?.message || "Semgrep finding";
-    out.push({
-      tool: "semgrep",
-      rule_id: String(ruleId),
-      severity: ["CRITICAL","HIGH","MEDIUM","LOW","INFO"].includes(sev) ? sev : "INFO",
-      file,
-      start_line: Number(start),
-      end_line: Number(end),
-      title: msg.slice(0, 120),
-      message: msg,
-      fingerprint: `${file}:${start}:${ruleId}`
-    });
-  }
-  return out;
+function toUpperSafe(s, fallback) {
+  if (!s) return fallback;
+  try { return String(s).toUpperCase(); } catch { return fallback; }
 }
 
-const repoPath = process.argv[2];
-if (!repoPath) {
-  console.error("Usage: node normalize-findings.js <path-to-neuron-demo>");
-  process.exit(1);
+function mapSemgrepSeverity(sev) {
+  const s = toUpperSafe(sev, "MEDIUM");
+  if (["CRITICAL", "HIGH", "MEDIUM", "LOW"].includes(s)) return s;
+  // Semgrep sometimes returns "WARNING" etc; map to nearest.
+  if (s === "WARNING") return "MEDIUM";
+  if (s === "ERROR") return "HIGH";
+  return "MEDIUM";
 }
 
-const semgrepPath = path.join(repoPath, "semgrep.json");
-if (!fs.existsSync(semgrepPath)) {
-  console.error(`semgrep.json not found at ${semgrepPath}. Run Semgrep first.`);
-  process.exit(1);
+/**
+ * Normalize a single Semgrep result into Neuron schema.
+ * Semgrep shape reference:
+ *  - result.check_id
+ *  - result.path
+ *  - result.start.line / result.end.line
+ *  - result.extra.message
+ *  - result.extra.severity
+ *  - result.extra.metadata?.title / docs / category
+ */
+function normalizeSemgrepResult(r) {
+  const ruleId = r?.check_id ?? "unknown";
+  const engine = "semgrep";
+  const title =
+    r?.extra?.metadata?.title ||
+    (r?.extra?.message ? String(r.extra.message).split("\n")[0] : ruleId);
+
+  const meta = r?.extra?.metadata || {};
+  const severity = mapSemgrepSeverity(r?.extra?.severity);
+
+  return {
+    id: `${engine}.${ruleId}`,
+    engine,
+    rule_id: ruleId,
+    severity,
+    file: r?.path || r?.extra?.path || "unknown",
+    start_line: Number(r?.start?.line ?? 0) || 0,
+    end_line: Number(r?.end?.line ?? r?.start?.line ?? 0) || 0,
+    title,
+    message: r?.extra?.message || title,
+    metadata: {
+      ruleCategory: meta.category ?? null,
+      docs: meta.docs ?? null,
+      raw: r?.extra ?? null
+    }
+  };
 }
 
-const sem = JSON.parse(fs.readFileSync(semgrepPath, "utf8"));
-const findings = mapSemgrep(sem);
+/**
+ * Entry: normalize a whole Semgrep JSON object
+ * Expected input: { results: [ ... ] }
+ */
+export function normalizeSemgrepJson(semgrepJson) {
+  const results = Array.isArray(semgrepJson?.results) ? semgrepJson.results : [];
+  return results.map(normalizeSemgrepResult);
+}
 
-const outPath = path.join(repoPath, "findings.json");
-fs.writeFileSync(outPath, JSON.stringify(findings, null, 2));
-console.log(`✅ Wrote ${outPath} with ${findings.length} findings`);
+// --- Optional CLI mode (useful for local debugging) ---
+// node analyzers/normalize-findings.js /path/to/semgrep.json
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const fs = await import("node:fs");
+  const path = process.argv[2];
+  const raw = fs.readFileSync(path, "utf8");
+  const semgrepObj = JSON.parse(raw);
+  const normalized = normalizeSemgrepJson(semgrepObj);
+  process.stdout.write(JSON.stringify(normalized, null, 2));
+}
