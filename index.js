@@ -12,6 +12,12 @@ import addFormats from "ajv-formats";
 import * as yaml from "js-yaml";
 import { OpenAIClient, AzureKeyCredential } from "@azure/openai";
 
+import { buildMessages } from "./prompts.js";
+import {
+  readBaseline, writeBaseline, ensureBaselineDir,
+  shouldSkipComment, recordComments
+} from "./baseline.js";
+
 dotenv.config();
 
 /* =======================
@@ -26,7 +32,7 @@ const AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT || "";
 const AZURE_OPENAI_KEY = process.env.AZURE_OPENAI_KEY || "";
 const AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT || "";
 
-// If set true, we ALWAYS post a summary comment (even when 0 findings/tests)
+// Always post summary (even when 0 findings/tests)
 const ALWAYS_COMMENT = (process.env.NEURON_ALWAYS_COMMENT || "true").toLowerCase() === "true";
 // Verbose server logs
 const DEBUG = (process.env.DEBUG_RENDER || "").toLowerCase() === "true";
@@ -47,7 +53,6 @@ app.get("/", (_req, res) => {
   res.send("Neuron webhook (LLM mode) running");
 });
 
-// Non-secret diagnostics to debug deploys without leaking keys
 app.get("/diag", (_req, res) => {
   res.json({
     ok: true,
@@ -126,7 +131,7 @@ const JSON_SCHEMA = {
   properties: {
     comments: {
       type: "array",
-      maxItems: 5,
+      maxItems: 3,
       items: {
         type: "object",
         required: ["path", "line", "severity", "title", "body"],
@@ -141,7 +146,7 @@ const JSON_SCHEMA = {
     },
     tests: {
       type: "array",
-      maxItems: 3,
+      maxItems: 2,
       items: {
         type: "object",
         required: ["language", "framework", "path", "mode", "content"],
@@ -173,7 +178,6 @@ async function handlePullRequest(payload) {
 
   console.log(`[info] Handling PR #${pull_number} @ ${owner}/${repo}`);
 
-  // Early Azure check
   if (!openai || !AZURE_OPENAI_DEPLOYMENT) {
     await postIssueComment(owner, repo, pull_number,
       "⚠️ Neuron could not generate a plan — **AZURE_CONFIG_MISSING** (endpoint/key/deployment not set).");
@@ -188,13 +192,13 @@ async function handlePullRequest(payload) {
   console.log("[info] workdir:", workdir);
   exec(`git clone --depth=50 --branch "${headRef}" "${cloneUrl}" "${workdir}"`);
 
-  // Changed files (cap to 100, cap patch size)
+  // Changed files (cap + trim patches)
   const filesResp = await octokit.pulls.listFiles({ owner, repo, pull_number, per_page: 100 });
   const changedRaw = filesResp.data || [];
   const changed = trimChangedFiles(changedRaw);
 
-  // Business context
-  const business = readBusinessContext(workdir);
+  // Signals (auto-detected repo hints)
+  const signals = collectRepoSignals(workdir);
 
   // Languages / frameworks
   const languages = detectLanguages(changed, workdir);
@@ -213,20 +217,20 @@ async function handlePullRequest(payload) {
       test_frameworks: testFrameworks,
       package_manager: detectPackageManager(workdir)
     },
-    business_rules: business.rules,
-    user_stories: business.userStories,
-    checklists: business.checklists,
+    // "Rules-free": instead of business docs, we pass mined signals + the diff
+    signals,
     changed_files: changed,
     existing_tests: existingTests,
     requirements: {
-      max_comments: cfg.max_inline_comments ?? 3,
-      test_policy: "append_or_create",
-      test_path_hints: ["__tests__/", "src/test/java/"],
-      language_preference_order: ["typescript", "javascript", "java", "python"]
+      max_comments: cfg.max_inline_comments ?? 3
     }
   };
 
-  const { plan, diag } = await getLLMPlanWithFallback(input);
+  // Build messages with compact context
+  const messages = buildMessages(input, JSON.stringify(JSON_SCHEMA));
+
+  // Get plan (with JSON-mode first, then fallback-extract)
+  const { plan, diag } = await getLLMPlanWithFallback(messages);
 
   if (!plan) {
     const reason = diag?.code || "UNKNOWN";
@@ -236,18 +240,35 @@ async function handlePullRequest(payload) {
     return;
   }
 
-  // Apply plan
-  const applied = await applyPlan(workdir, plan, { owner, repo, pr });
+  // Baseline: avoid repeats
+  ensureBaselineDir(workdir);
+  const baseline = readBaseline(workdir);
+  const filteredComments = (plan.comments || []).filter(c => !shouldSkipComment(workdir, baseline, c)).slice(0, 3);
+  const filteredPlan = { ...plan, comments: filteredComments };
 
-  // Post business-context summary (ALWAYS, unless explicitly disabled)
+  // Apply plan
+  const applied = await applyPlan(workdir, filteredPlan, { owner, repo, pr });
+
+  // Update baseline with posted comments (only the ones we actually used)
+  const baselineChanged = recordComments(workdir, baseline, filteredComments);
+  if (baselineChanged) {
+    writeBaseline(workdir, baseline);
+  }
+
+  // Commit & push tests and baseline together, if any changed
+  const filesToCommit = [...(applied.tests_written || [])];
+  if (baselineChanged) filesToCommit.push(".neuron/baseline.json");
+  if (filesToCommit.length) {
+    exec(`git -C "${workdir}" add ${filesToCommit.map(w => `"${w}"`).join(" ")}`);
+    exec(`git -C "${workdir}" -c user.email="neuron[bot]@example.com" -c user.name="Neuron Bot" commit -m "chore(neuron): generated tests & updated baseline"`);
+    exec(`git -C "${workdir}" push origin HEAD:${pr.head.ref}`);
+  }
+
+  // Post summary (always)
   if (ALWAYS_COMMENT) {
-    await postSummary(owner, repo, pull_number, plan, applied, {
+    await postSummary(owner, repo, pull_number, filteredPlan, applied, {
       languages,
-      businessPresence: {
-        rules: !!business.rules,
-        userStories: !!business.userStories,
-        checklists: !!business.checklists
-      },
+      signals: { ...signals, _trimmed: true },
       changedCount: changed.length,
       diagCode: diag?.code || "OK"
     });
@@ -255,13 +276,12 @@ async function handlePullRequest(payload) {
 }
 
 /* =======================
-   Input Trimming / Repo Introspection
+   Input Trimming & Signals
 ======================= */
 
 function trimChangedFiles(files) {
-  // Prevent token explosion by limiting patch size per file and total files
   const MAX_FILES = 25;
-  const MAX_PATCH_CHARS_PER_FILE = 5000; // ~few screens per file
+  const MAX_PATCH_CHARS_PER_FILE = 5000;
   const out = [];
   for (const f of files.slice(0, MAX_FILES)) {
     let patch = f.patch || "";
@@ -280,23 +300,65 @@ function trimChangedFiles(files) {
   return out;
 }
 
-function readBusinessContext(workdir) {
-  const rules = readFileIfExists(path.join(workdir, "business", "rules.md"));
-  const userStories = readFileIfExists(path.join(workdir, "business", "user_stories.md"));
-  const checklistsPath = path.join(workdir, "business", "checklists.yaml");
-  let checklists = "";
-  try {
-    if (fs.existsSync(checklistsPath)) {
-      const doc = yaml.load(fs.readFileSync(checklistsPath, "utf8"));
-      checklists = JSON.stringify(doc);
-      if (checklists.length > 4000) checklists = checklists.slice(0, 4000);
-    }
-  } catch {}
+// Mine small, useful hints about the domain/stack without heavy parsing.
+function collectRepoSignals(workdir) {
+  const pkg = readJsonSafe(path.join(workdir, "package.json"));
+  const deps = pkg ? { ...pkg.dependencies, ...pkg.devDependencies } : {};
+  const has = (name) => !!deps?.[name];
+
+  const depsList = Object.keys(deps || {}).slice(0, 40);
+  const envExample = readFileIfExists(path.join(workdir, ".env")).slice(0, 2000);
+  const readme = readFileIfExists(path.join(workdir, "README.md")).slice(0, 2000);
+
+  // Light route/controller/schema discovery (very shallow, just filenames)
+  const routes = findFiles(workdir, ["pages", "routes", "api"], [".js", ".ts", ".tsx"]).slice(0, 30);
+  const schema = findFiles(workdir, ["schema", "prisma", "migrations", "db"], [".sql", ".prisma", ".ts"]).slice(0, 30);
+  const testNames = findFiles(workdir, ["__tests__", "tests", "src/test"], [".test.js", ".spec.js", ".test.ts", ".java", ".py"]).slice(0, 30);
+
   return {
-    rules: rules.slice(0, 8000),
-    userStories: userStories.slice(0, 8000),
-    checklists
+    deps: depsList,
+    stack_hints: {
+      react: has("react") || has("next"),
+      nextjs: has("next"),
+      express: has("express"),
+      stripe: has("stripe") || has("@stripe/stripe-js"),
+      prisma: has("@prisma/client"),
+      graphql: has("graphql") || has("@apollo/client") || has("@apollo/server"),
+      axios: has("axios")
+    },
+    env_snippet: envExample,
+    readme_snippet: readme,
+    route_files: routes,
+    schema_files: schema,
+    test_files: testNames
   };
+}
+
+function findFiles(root, folders, exts) {
+  const results = [];
+  function walk(dir, depth = 0) {
+    if (depth > 3) return;
+    let list = [];
+    try { list = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of list) {
+      const p = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        // only descend into interesting folders or top-level
+        if (depth === 0 || folders.some(f => p.includes(`/${f}`))) walk(p, depth + 1);
+      } else {
+        const lower = entry.name.toLowerCase();
+        if (exts.some(ext => lower.endsWith(ext))) {
+          results.push(path.relative(root, p));
+        }
+      }
+    }
+  }
+  walk(root, 0);
+  return results;
+}
+
+function readJsonSafe(p) {
+  try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return null; }
 }
 
 function detectLanguages(changed, workdir) {
@@ -356,134 +418,42 @@ function readNeuronConfig(workdir) {
 }
 
 /* =======================
-   Azure LLM w/ Fallback + Plan Shaping
+   Azure LLM (JSON mode + fallback)
 ======================= */
 
-// Few-shot example to force the shape (both keys present, arrays allowed to be empty)
-const FEW_SHOT_EXAMPLE = {
-  comments: [
-    {
-      path: "src/payments/PaymentSelector.tsx",
-      line: 128,
-      severity: "HIGH",
-      title: "Multi-payment regression risk",
-      body: "Business rule BR-12: default to last used method for users with >1 saved method. This change removes preferredPaymentId lookup; multi-method users will default to first item. Suggested fix: restore last-used lookup and fall back to explicit selection if null."
-    }
-  ],
-  tests: [
-    {
-      language: "javascript",
-      framework: "jest",
-      path: "__tests__/neuron.generated.test.js",
-      mode: "append_or_create",
-      content: "// neuron generated test\n test('selects last used payment when multiple exist', () => { /* ... */ });"
-    }
-  ]
-};
-
-function ensurePlanShape(plan) {
-  // Guardrail: if model forgets required top-level keys, add empty arrays
-  if (plan == null || typeof plan !== "object") return { comments: [], tests: [] };
-  if (!Array.isArray(plan.comments)) plan.comments = [];
-  if (!Array.isArray(plan.tests)) plan.tests = [];
-  return plan;
-}
-
-function extractFirstJsonObject(text) {
-  const fence = text.indexOf("```");
-  if (fence !== -1) {
-    const fenceEnd = text.indexOf("```", fence + 3);
-    const inside = fenceEnd !== -1 ? text.slice(fence + 3, fenceEnd) : text.slice(fence + 3);
-    const braceStart = inside.indexOf("{");
-    const braceEnd = inside.lastIndexOf("}");
-    if (braceStart !== -1 && braceEnd !== -1 && braceEnd > braceStart) {
-      return inside.slice(braceStart, braceEnd + 1);
-    }
-  }
-  const s = text.indexOf("{");
-  const e = text.lastIndexOf("}");
-  if (s !== -1 && e !== -1 && e > s) {
-    return text.slice(s, e + 1);
-  }
-  return "";
-}
-
-async function getLLMPlanWithFallback(input) {
-  const SYSTEM = [
-    "You are Neuron, an expert reviewer who enforces product/business rules.",
-    "Return ONLY valid JSON matching the provided JSON schema.",
-    "Include BOTH top-level keys: comments (array) and tests (array).",
-    "If you have nothing to say for one section, return an empty array for that section."
-  ].join(" ");
-  const schemaStr = JSON.stringify(JSON_SCHEMA);
-
-  // Try strict JSON mode first
+async function getLLMPlanWithFallback(messages) {
+  // Try strict JSON mode
   try {
-    const messages = [
-      { role: "system", content: SYSTEM },
-      {
-        role: "user",
-        content: JSON.stringify({
-          ...input,
-          json_schema: schemaStr,
-          example: FEW_SHOT_EXAMPLE
-        })
-      }
-    ];
-
     const resp = await openai.getChatCompletions(AZURE_OPENAI_DEPLOYMENT, messages, {
       temperature: 0.2,
       maxTokens: 1200,
       responseFormat: { type: "json_object" }
     });
-
     const content = resp.choices?.[0]?.message?.content || "";
-    let plan = JSON.parse(content);
-    plan = ensurePlanShape(plan);
-
-    const valid = validatePlan(plan);
-    if (!valid) {
-      // One retry with explicit correction request
-      const retry = await openai.getChatCompletions(
-        AZURE_OPENAI_DEPLOYMENT,
-        [
-          { role: "system", content: SYSTEM },
-          { role: "user", content: "Your last output did not satisfy the schema. Produce ONLY a JSON object with keys comments:[] and tests:[] (arrays may be empty)." },
-          { role: "user", content: JSON.stringify({ ...input, json_schema: schemaStr, example: FEW_SHOT_EXAMPLE }) }
-        ],
-        { temperature: 0.1, maxTokens: 1200, responseFormat: { type: "json_object" } }
-      );
-      const content2 = retry.choices?.[0]?.message?.content || "";
-      plan = ensurePlanShape(JSON.parse(content2));
-      if (!validatePlan(plan)) {
-        return { plan: null, diag: { code: "SCHEMA_INVALID", detail: JSON.stringify(validatePlan.errors).slice(0, 500) } };
-      }
+    const plan = JSON.parse(content);
+    if (!validatePlan(plan)) {
+      return { plan: null, diag: { code: "SCHEMA_INVALID", detail: JSON.stringify(validatePlan.errors).slice(0, 500) } };
     }
     return { plan, diag: { code: "OK_JSON_MODE" } };
   } catch (err) {
     DEBUG && console.warn("[warn] JSON mode failed; falling back:", err?.message || err);
   }
 
-  // Retry WITHOUT JSON mode; then extract JSON from text
+  // Fallback: ask for JSON but extract from free-form if needed
   try {
-    const messages = [
-      { role: "system", content: SYSTEM },
-      { role: "user", content: JSON.stringify({ ...input, json_schema: JSON.stringify(JSON_SCHEMA), example: FEW_SHOT_EXAMPLE }) },
-      { role: "system", content: "Return ONLY a JSON object with keys comments (array) and tests (array). Do not include any prose outside JSON." }
+    const forced = [
+      ...messages,
+      { role: "system", content: "Return ONLY a JSON object with keys `comments` (array) and `tests` (array). No prose outside JSON." }
     ];
-
-    const resp = await openai.getChatCompletions(AZURE_OPENAI_DEPLOYMENT, messages, {
+    const resp = await openai.getChatCompletions(AZURE_OPENAI_DEPLOYMENT, forced, {
       temperature: 0.1,
       maxTokens: 1400
     });
     const raw = resp.choices?.[0]?.message?.content || "";
     const candidate = extractFirstJsonObject(raw);
-    if (!candidate) {
-      return { plan: null, diag: { code: "JSON_MISSING", detail: (raw || "").slice(0, 350) } };
-    }
-    let plan = ensurePlanShape(JSON.parse(candidate));
-    const valid = validatePlan(plan);
-    if (!valid) {
+    if (!candidate) return { plan: null, diag: { code: "JSON_MISSING", detail: raw.slice(0, 350) } };
+    const plan = JSON.parse(candidate);
+    if (!validatePlan(plan)) {
       return { plan: null, diag: { code: "SCHEMA_INVALID", detail: JSON.stringify(validatePlan.errors).slice(0, 500) } };
     }
     return { plan, diag: { code: "OK_FALLBACK" } };
@@ -496,6 +466,19 @@ async function getLLMPlanWithFallback(input) {
       "MODEL_REJECT";
     return { plan: null, diag: { code, detail: msg.slice(0, 400) } };
   }
+}
+
+function extractFirstJsonObject(text) {
+  const fence = text.indexOf("```");
+  if (fence !== -1) {
+    const fenceEnd = text.indexOf("```", fence + 3);
+    const inside = fenceEnd !== -1 ? text.slice(fence + 3, fenceEnd) : text.slice(fence + 3);
+    const s = inside.indexOf("{"), e = inside.lastIndexOf("}");
+    if (s !== -1 && e !== -1 && e > s) return inside.slice(s, e + 1);
+  }
+  const s = text.indexOf("{"), e = text.lastIndexOf("}");
+  if (s !== -1 && e !== -1 && e > s) return text.slice(s, e + 1);
+  return "";
 }
 
 /* =======================
@@ -550,14 +533,7 @@ async function applyPlan(workdir, plan, ctx) {
     written.push(path.relative(workdir, target));
   }
 
-  // Commit & push
-  if (written.length) {
-    exec(`git -C "${workdir}" add ${written.map(w => `"${w}"`).join(" ")}`);
-    exec(`git -C "${workdir}" -c user.email="neuron[bot]@example.com" -c user.name="Neuron Bot" commit -m "chore(neuron): add/update generated tests"`);
-    exec(`git -C "${workdir}" push origin HEAD:${pr.head.ref}`);
-  }
-
-  // Comments (cap 3 for inline-style summary list)
+  // Comments (cap 3)
   const toPost = (plan.comments || []).slice(0, 3).filter(c => {
     const fp = `${c.path}:${c.line}:${c.title}`;
     if (fpSet.has(fp)) return false;
@@ -565,8 +541,6 @@ async function applyPlan(workdir, plan, ctx) {
     return true;
   });
 
-  // Combined comment body (if there are any findings, we’ll list them here;
-  // otherwise postSummary() will still post an empty summary)
   if (toPost.length) {
     let body = `**Neuron — Business-context review**\n\n`;
     for (const c of toPost) {
@@ -582,7 +556,6 @@ async function applyPlan(workdir, plan, ctx) {
 }
 
 async function postSummary(owner, repo, pull_number, plan, applied, meta) {
-  // ALWAYS post a summary (unless env disables). This prevents "silence".
   const commentsCount = plan.comments?.length || 0;
   const testsCount = plan.tests?.length || 0;
   const wroteCount = applied.tests_written?.length || 0;
@@ -596,17 +569,9 @@ async function postSummary(owner, repo, pull_number, plan, applied, meta) {
   }
 
   body += `\n**Context**\n`;
-  body += `- Languages seen: ${meta.languages.length ? meta.languages.join(", ") : "(none detected)"}\n`;
-  body += `- Business rules present: rules=${meta.businessPresence.rules}, user_stories=${meta.businessPresence.userStories}, checklists=${meta.businessPresence.checklists}\n`;
+  body += `- Languages detected: ${meta.languages.length ? meta.languages.join(", ") : "(none)"}\n`;
   body += `- Changed files analyzed: ${meta.changedCount}\n`;
   body += `- LLM mode: ${meta.diagCode}\n`;
-
-  if (commentsCount === 0 && testsCount === 0) {
-    body += `\n_No business-impact issues detected and no test cases proposed by the model._`;
-    if (!meta.businessPresence.rules && !meta.businessPresence.userStories && !meta.businessPresence.checklists) {
-      body += `\n> Tip: add \`/business/rules.md\` or \`/business/checklists.yaml\` to give Neuron stronger domain context.`;
-    }
-  }
 
   await postIssueComment(owner, repo, pull_number, body);
 }
