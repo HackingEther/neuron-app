@@ -3,236 +3,437 @@ import getRawBody from "raw-body";
 import crypto from "crypto";
 import { Octokit } from "@octokit/rest";
 import dotenv from "dotenv";
-
 import { execSync } from "node:child_process";
 import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import Ajv from "ajv";
+import addFormats from "ajv-formats";
+import * as yaml from "js-yaml";
 
-// --- Azure OpenAI (Foundry) ---
+// Azure OpenAI
 import { OpenAIClient, AzureKeyCredential } from "@azure/openai";
 
 dotenv.config();
 
+const PORT = process.env.PORT || 3000;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+
+const AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT || "";
+const AZURE_OPENAI_KEY = process.env.AZURE_OPENAI_KEY || "";
+const AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT || "";
+
+if (!WEBHOOK_SECRET) {
+  console.warn("[warn] WEBHOOK_SECRET is not set");
+}
+if (!GITHUB_TOKEN) {
+  console.warn("[warn] GITHUB_TOKEN is not set; Git operations will likely fail");
+}
+
+const octokit = new Octokit({ auth: GITHUB_TOKEN });
+const openai =
+  AZURE_OPENAI_ENDPOINT && AZURE_OPENAI_KEY
+    ? new OpenAIClient(AZURE_OPENAI_ENDPOINT, new AzureKeyCredential(AZURE_OPENAI_KEY))
+    : null;
+
 const app = express();
-const {
-  WEBHOOK_SECRET,
-  GITHUB_TOKEN,
-  PORT = 3000,
 
-  // Azure OpenAI bits (set these in Render)
-  AZURE_OPENAI_ENDPOINT,
-  AZURE_OPENAI_KEY,
-  AZURE_OPENAI_DEPLOYMENT,      // e.g. "neuron-llm"
-  AZURE_OPENAI_API_VERSION = "2024-02-01"
-} = process.env;
-
-// Prepare Azure client if configured
-let aoaiClient = null;
-if (AZURE_OPENAI_ENDPOINT && AZURE_OPENAI_KEY) {
-  try {
-    aoaiClient = new OpenAIClient(
-      AZURE_OPENAI_ENDPOINT,
-      new AzureKeyCredential(AZURE_OPENAI_KEY),
-      { apiVersion: AZURE_OPENAI_API_VERSION }
-    );
-  } catch (e) {
-    console.error("Failed to construct Azure OpenAI client:", e);
-  }
-}
-
-// (Optional) help Render/Linux find semgrep if it's installed via pipx
-process.env.PATH = [
-  process.env.PATH,
-  "/opt/render/.cache/pipx/venvs/semgrep/bin",
-  `${process.env.HOME || ""}/.local/bin`,
-  `${process.env.HOME || ""}/.local/pipx/venvs/semgrep/bin`,
-].filter(Boolean).join(":");
-
-// Verify webhook HMAC signature (proves request is from GitHub)
-function verify(sigHeader, raw) {
-  const expected = "sha256=" + crypto.createHmac("sha256", WEBHOOK_SECRET).update(raw).digest("hex");
-  return sigHeader === expected;
-}
-
-// Utility: get list of changed files (quick summary for LLM)
-function extractChangedFiles(payload) {
-  const pr = payload.pull_request;
-  const files = [];
-  // We don’t have the full file list in this payload;
-  // include head/base refs for context instead.
-  files.push(`base: ${pr.base.ref} @ ${pr.base.sha.slice(0,7)}`);
-  files.push(`head: ${pr.head.ref} @ ${pr.head.sha.slice(0,7)}`);
-  return files;
-}
-
-// Utility: call Azure OpenAI to produce a short “Neuron Test Plan”
-async function generateTestPlan({ repoFull, prNum, files, findings }) {
-  // Build a compact context for the model
-  const findingsBullets = (findings || []).slice(0, 5).map(f =>
-    `• [${f.severity}] ${f.rule_id} in ${f.file}:L${f.start_line} — ${f.title}`
-  ).join("\n");
-
-  const sys = [
-    "You are Neuron, a senior QA engineer.",
-    "You generate concise test plans tailored to a PR.",
-    "Focus on business-risk coverage, not generic unit tests.",
-    "Output 3–5 bullet points. Prefer plain steps and expected checks.",
-  ].join(" ");
-
-  const user = [
-    `Repository: ${repoFull}`,
-    `PR #${prNum}`,
-    `Changed refs:\n${files.map(f => `- ${f}`).join("\n")}`,
-    findings && findings.length ? `\nStatic findings:\n${findingsBullets}` : "\nStatic findings: none",
-    "\nProduce a short 'Neuron Test Plan' with 3–5 bullets. Keep it under 120 words."
-  ].join("\n");
-
-  if (!aoaiClient || !AZURE_OPENAI_DEPLOYMENT) {
-    // Fallback text if Azure isn’t configured fully
-    return {
-      ok: false,
-      text: "ℹ️ LLM not configured (missing endpoint/key/deployment). Skipping test plan.",
-    };
-  }
-
-  try {
-    const resp = await aoaiClient.getChatCompletions(
-      AZURE_OPENAI_DEPLOYMENT,
-      [
-        { role: "system", content: sys },
-        { role: "user", content: user }
-      ],
-      { temperature: 0.2, maxTokens: 220 }
-    );
-    const choice = resp?.choices?.[0]?.message?.content?.trim();
-    if (choice) {
-      return { ok: true, text: choice };
-    }
-    return { ok: false, text: "LLM returned no content." };
-  } catch (e) {
-    console.error("Azure OpenAI call failed:", e?.message || e);
-    return { ok: false, text: `LLM error: ${String(e).slice(0, 300)}` };
-  }
-}
-
+// We need raw body for signature verification
 app.post("/webhook", async (req, res) => {
   try {
     const raw = await getRawBody(req);
     const sig = req.headers["x-hub-signature-256"];
-    if (!sig || !verify(sig, raw)) return res.status(401).send("Bad signature");
-
     const event = req.headers["x-github-event"];
-    const payload = JSON.parse(raw.toString("utf8"));
-
-    if (event === "pull_request" && ["opened", "synchronize", "reopened"].includes(payload.action)) {
-      const owner = payload.repository.owner.login;
-      const repo  = payload.repository.name;
-      const repoFull = payload.repository.full_name;
-      const prNum = payload.number;
-
-      const headRef = payload.pull_request.head.ref;                 // e.g. "test-branch"
-      const headRepoFull = payload.pull_request.head.repo.full_name; // e.g. "HackingEther/neuron-demo"
-
-      const octokit = new Octokit({ auth: GITHUB_TOKEN });
-
-      // tracer comment so you know the run started
-      await octokit.issues.createComment({
-        owner, repo, issue_number: prNum,
-        body: "🔧 Neuron: starting static checks…"
-      });
-
-      // temp workspace
-      const work = fs.mkdtempSync(path.join(os.tmpdir(), "neuron-"));
-      const repoDir = path.join(work, "repo");
-
-      let findings = [];
-      try {
-        // shallow clone the PR branch
-        execSync(
-          `git clone --depth 1 --branch "${headRef}" "https://github.com/${headRepoFull}.git" repo`,
-          { cwd: work, stdio: "inherit" }
-        );
-
-        // prefer repo-level semgrep.yml if present, else fallback to our server copy
-        const repoRules = path.join(repoDir, "semgrep.yml");
-        const serverRules = path.resolve("semgrep.yml");
-        const rulesPath = fs.existsSync(repoRules) ? repoRules : serverRules;
-
-        // analyzer wrapper
-        const runScript = path.resolve("analyzers", "run-and-normalize.js");
-        if (!fs.existsSync(runScript)) {
-          throw new Error(`Missing analyzer wrapper at ${runScript}. Create analyzers/run-and-normalize.js.`);
-        }
-        if (!fs.existsSync(rulesPath)) {
-          throw new Error(`Missing semgrep rules at ${rulesPath}. Add a semgrep.yml to repo or server root.`);
-        }
-
-        // run semgrep and normalize to canonical findings[]
-        const findingsJson = execSync(
-          `node "${runScript}" "${repoDir}" "${rulesPath}"`,
-          { encoding: "utf8" }
-        );
-        const parsed = JSON.parse(findingsJson);
-        findings = Array.isArray(parsed) ? parsed : [];
-
-        // Build a short PR-level summary
-        const total = findings.length;
-        const top = findings.slice(0, 5).map(f =>
-          `- **${f.severity}** \`${f.rule_id}\` in \`${f.file}\` @ L${f.start_line}\n  ${f.title}`
-        ).join("\n");
-
-        const staticBody = total === 0
-          ? "✅ Neuron: no issues found by Semgrep."
-          : `🧠 **Neuron static checks (Semgrep)**\n\n**${total} finding(s)**:\n\n${top}\n\n_Artifact generated server-side: \`findings.json\`._`;
-
-        await octokit.issues.createComment({ owner, repo, issue_number: prNum, body: staticBody });
-        console.log(`Posted analyzer summary to PR #${prNum} in ${owner}/${repo}`);
-      } catch (e) {
-        console.error("Analyzer error:", e);
-        await octokit.issues.createComment({
-          owner, repo, issue_number: prNum,
-          body: `⚠️ Neuron: analyzer failed.\n\n\`\`\`\n${String(e).slice(0, 1500)}\n\`\`\``
-        });
-      } finally {
-        try { fs.rmSync(work, { recursive: true, force: true }); } catch {}
-      }
-
-      // --- LLM: Neuron Test Plan ---
-      try {
-        const files = extractChangedFiles(payload);
-        const plan = await generateTestPlan({
-          repoFull,
-          prNum,
-          files,
-          findings
-        });
-
-        const llmComment = plan.ok
-          ? `🧪 **Neuron Test Plan (LLM)**\n\n${plan.text}`
-          : `ℹ️ **Neuron LLM step**\n\n${plan.text}`;
-
-        await octokit.issues.createComment({
-          owner, repo, issue_number: prNum, body: llmComment
-        });
-        console.log("Posted LLM test plan");
-      } catch (e) {
-        console.error("LLM step failed:", e);
-        await octokit.issues.createComment({
-          owner, repo, issue_number: prNum,
-          body: `⚠️ Neuron: LLM step failed.\n\n\`\`\`\n${String(e).slice(0, 800)}\n\`\`\``
-        });
-      }
+    if (!verifySignature(sig, raw)) {
+      return res.status(401).send("Invalid signature");
     }
 
+    const payload = JSON.parse(raw.toString("utf8"));
+    if (event !== "pull_request") {
+      return res.status(200).send("Ignored");
+    }
+    const action = payload.action;
+    if (!["opened", "reopened", "synchronize", "ready_for_review"].includes(action)) {
+      return res.status(200).send("No-op for this PR action");
+    }
+
+    // Process PR
+    await handlePullRequest(payload);
     res.status(200).send("OK");
-  } catch (e) {
-    console.error(e);
+  } catch (err) {
+    console.error("[error] webhook handler failed:", err);
     res.status(500).send("Error");
   }
 });
 
-// Simple GET endpoint for health checks
-app.get("/", (_, res) => res.send("Neuron webhook running"));
+app.get("/", (_req, res) => {
+  res.send("Neuron webhook (LLM mode) running");
+});
 
-app.listen(PORT, () => console.log(`Neuron webhook listening on :${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Neuron webhook listening on :${PORT}`);
+});
+
+/* ----------------------- helpers ------------------------ */
+
+function verifySignature(sigHeader, raw) {
+  if (!WEBHOOK_SECRET) return false;
+  const expected = "sha256=" + crypto.createHmac("sha256", WEBHOOK_SECRET).update(raw).digest("hex");
+  return sigHeader === expected;
+}
+
+function tmpDir(prefix) {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  return base;
+}
+
+function exec(cmd, opts = {}) {
+  return execSync(cmd, { stdio: "inherit", ...opts });
+}
+
+const JSON_SCHEMA = {
+  type: "object",
+  required: ["comments", "tests"],
+  properties: {
+    comments: {
+      type: "array",
+      maxItems: 5,
+      items: {
+        type: "object",
+        required: ["path", "line", "severity", "title", "body"],
+        properties: {
+          path: { type: "string" },
+          line: { type: "integer", minimum: 1 },
+          severity: { type: "string", enum: ["LOW", "MEDIUM", "HIGH", "CRITICAL"] },
+          title: { type: "string", maxLength: 120 },
+          body: { type: "string", maxLength: 2000 }
+        }
+      }
+    },
+    tests: {
+      type: "array",
+      maxItems: 3,
+      items: {
+        type: "object",
+        required: ["language", "framework", "path", "mode", "content"],
+        properties: {
+          language: { type: "string" },
+          framework: { type: "string" },
+          path: { type: "string" },
+          mode: { type: "string", enum: ["create", "append_or_create", "replace"] },
+          content: { type: "string", minLength: 1 }
+        }
+      }
+    }
+  }
+};
+
+const ajv = new Ajv({ allErrors: true, strict: false });
+addFormats(ajv);
+const validatePlan = ajv.compile(JSON_SCHEMA);
+
+async function handlePullRequest(payload) {
+  const pr = payload.pull_request;
+  const owner = payload.repository.owner.login;
+  const repo = payload.repository.name;
+  const pull_number = pr.number;
+
+  console.log(`[info] Handling PR #${pull_number} @ ${owner}/${repo}`);
+
+  const headRef = pr.head.ref;
+  const headSha = pr.head.sha;
+  const cloneUrl = pr.head.repo.clone_url.replace("https://", `https://x-access-token:${GITHUB_TOKEN}@`);
+
+  // Temp working dir
+  const workdir = tmpDir("neuron-");
+  console.log("[info] workdir:", workdir);
+
+  // Clone PR head
+  exec(`git clone --depth=50 --branch "${headRef}" "${cloneUrl}" "${workdir}"`);
+
+  // Collect changed files with patches
+  const filesResp = await octokit.pulls.listFiles({ owner, repo, pull_number, per_page: 100 });
+  const changed = filesResp.data.map(f => ({
+    path: f.filename,
+    patch: f.patch || "",
+    status: f.status,
+    additions: f.additions,
+    deletions: f.deletions,
+    changes: f.changes
+  }));
+
+  // Gather business context from repo
+  const business = readBusinessContext(workdir);
+
+  // Detect languages/frameworks (very simple heuristic)
+  const languages = detectLanguages(changed, workdir);
+  const testFrameworks = frameworkMap(languages, workdir);
+
+  // Sample existing tests (snippets only, cap by bytes)
+  const existingTests = sampleExistingTests(workdir);
+
+  // Config (from repo if present)
+  const cfg = readNeuronConfig(workdir);
+
+  const input = {
+    repo_meta: {
+      owner, repo, headRef, headSha,
+      languages,
+      test_frameworks: testFrameworks,
+      package_manager: detectPackageManager(workdir)
+    },
+    business_rules: business.rules,
+    user_stories: business.userStories,
+    checklists: business.checklists,
+    changed_files: changed,
+    existing_tests: existingTests,
+    requirements: {
+      max_comments: cfg.max_inline_comments ?? 3,
+      test_policy: "append_or_create",
+      test_path_hints: ["__tests__/", "src/test/java/"],
+      language_preference_order: ["typescript", "javascript", "java", "python"]
+    }
+  };
+
+  const plan = await getLLMPlan(input);
+  if (!plan) {
+    await postIssueComment(owner, repo, pull_number, ":warning: Neuron could not generate a plan (LLM unavailable or invalid JSON).");
+    return;
+  }
+
+  // Apply the plan: write tests, commit, push; post comments (capped)
+  const applied = await applyPlan(workdir, plan, { owner, repo, pr });
+  await postSummary(owner, repo, pull_number, plan, applied);
+}
+
+function readFileIfExists(p) {
+  try { return fs.readFileSync(p, "utf8"); } catch { return ""; }
+}
+
+function readBusinessContext(workdir) {
+  const rules = readFileIfExists(path.join(workdir, "business", "rules.md"));
+  const userStories = readFileIfExists(path.join(workdir, "business", "user_stories.md"));
+  const checklistsPath = path.join(workdir, "business", "checklists.yaml");
+  let checklists = "";
+  try {
+    if (fs.existsSync(checklistsPath)) {
+      const doc = yaml.load(fs.readFileSync(checklistsPath, "utf8"));
+      checklists = JSON.stringify(doc).slice(0, 4000); // cap
+    }
+  } catch {}
+  return { rules: rules.slice(0, 8000), userStories: userStories.slice(0, 8000), checklists };
+}
+
+function detectLanguages(changed, workdir) {
+  const set = new Set();
+  for (const f of changed) {
+    if (f.path.endsWith(".ts") || f.path.endsWith(".tsx")) set.add("typescript");
+    else if (f.path.endsWith(".js") || f.path.endsWith(".jsx")) set.add("javascript");
+    else if (f.path.endsWith(".java")) set.add("java");
+    else if (f.path.endsWith(".py")) set.add("python");
+  }
+  // If no changed file hints, scan top-level package files
+  if (fs.existsSync(path.join(workdir, "package.json"))) set.add("javascript");
+  return Array.from(set);
+}
+
+function frameworkMap(languages, workdir) {
+  const map = {};
+  for (const l of languages) {
+    if (l === "typescript" || l === "javascript") map[l] = "jest";
+    else if (l === "java") map[l] = "junit";
+    else if (l === "python") map[l] = "pytest";
+  }
+  return map;
+}
+
+function detectPackageManager(workdir) {
+  if (fs.existsSync(path.join(workdir, "pnpm-lock.yaml"))) return "pnpm";
+  if (fs.existsSync(path.join(workdir, "yarn.lock"))) return "yarn";
+  if (fs.existsSync(path.join(workdir, "package-lock.json"))) return "npm";
+  return "unknown";
+}
+
+function sampleExistingTests(workdir) {
+  const out = [];
+  function addIfExists(rel) {
+    const abs = path.join(workdir, rel);
+    if (fs.existsSync(abs) && fs.lstatSync(abs).isDirectory()) {
+      const files = fs.readdirSync(abs).filter(f => f.endsWith(".test.js") || f.endsWith(".spec.js") || f.endsWith(".test.ts") || f.endsWith(".java") || f.endsWith(".py"));
+      for (const f of files.slice(0, 10)) {
+        const p = path.join(abs, f);
+        const txt = fs.readFileSync(p, "utf8");
+        out.push({ path: path.relative(workdir, p), snippet: txt.slice(0, 1200) });
+      }
+    }
+  }
+  addIfExists("__tests__");
+  addIfExists("tests");
+  addIfExists("src/test/java");
+  return out.slice(0, 20);
+}
+
+function readNeuronConfig(workdir) {
+  const p = path.join(workdir, "neuron.config.yml");
+  if (!fs.existsSync(p)) return {};
+  try {
+    const doc = yaml.load(fs.readFileSync(p, "utf8"));
+    return doc?.neuron || {};
+  } catch {
+    return {};
+  }
+}
+
+async function getLLMPlan(input) {
+  if (!openai) {
+    console.warn("[warn] Azure OpenAI not configured");
+    return null;
+  }
+  const system = [
+    "You are Neuron, an expert software reviewer who enforces product/business rules.",
+    "Return ONLY valid JSON that matches the provided JSON schema.",
+    "Prioritize business impact over style."
+  ].join(" ");
+
+  const schemaStr = JSON.stringify(JSON_SCHEMA);
+
+  const messages = [
+    { role: "system", content: system },
+    { role: "user", content: JSON.stringify({ ...input, json_schema: schemaStr }) }
+  ];
+
+  try {
+    const result = await openai.getChatCompletions(AZURE_OPENAI_DEPLOYMENT, messages, {
+      temperature: 0.2,
+      maxTokens: 1200,
+      responseFormat: { type: "json_object" }
+    });
+    const content = result.choices?.[0]?.message?.content;
+    if (!content) return null;
+    let plan;
+    try {
+      plan = JSON.parse(content);
+    } catch (e) {
+      console.warn("[warn] LLM returned invalid JSON, retrying once with correction");
+      const retry = await openai.getChatCompletions(
+        AZURE_OPENAI_DEPLOYMENT,
+        [
+          { role: "system", content: system },
+          { role: "user", content: "Your previous response was not valid JSON. Return VALID JSON only that conforms to this schema: " + schemaStr },
+          { role: "user", content: JSON.stringify(input) }
+        ],
+        { temperature: 0.1, maxTokens: 1200, responseFormat: { type: "json_object" } }
+      );
+      const content2 = retry.choices?.[0]?.message?.content;
+      if (!content2) return null;
+      plan = JSON.parse(content2);
+    }
+    const valid = validatePlan(plan);
+    if (!valid) {
+      console.error("[error] Plan schema invalid:", validatePlan.errors);
+      return null;
+    }
+    return plan;
+  } catch (err) {
+    console.error("[error] Azure OpenAI call failed:", err);
+    return null;
+  }
+}
+
+function ensureSafePath(root, rel, fallback) {
+  const abs = path.resolve(root, rel);
+  if (!abs.startsWith(path.resolve(root))) {
+    return path.join(root, fallback);
+  }
+  return abs;
+}
+
+function withChecksum(content) {
+  const cryptoHash = crypto.createHash("sha256").update(content, "utf8").digest("hex");
+  return `// neuron:generated checksum=${cryptoHash}\n${content}\n`;
+}
+
+function alreadyHasChecksum(content) {
+  return /neuron:generated checksum=([a-f0-9]{64})/.test(content);
+}
+
+async function applyPlan(workdir, plan, ctx) {
+  const { owner, repo, pr } = ctx;
+  const written = [];
+  const commentFingerprints = new Set();
+
+  // Write tests
+  for (const t of plan.tests || []) {
+    const defaultPath = t.language === "java"
+      ? "src/test/java/NeuronGeneratedTest.java"
+      : "__tests__/neuron.generated.test.js";
+    const safe = ensureSafePath(workdir, t.path, defaultPath);
+    const mode = t.mode || "append_or_create";
+
+    let existing = "";
+    if (fs.existsSync(safe)) {
+      existing = fs.readFileSync(safe, "utf8");
+      if (alreadyHasChecksum(existing) && existing.includes(t.content)) {
+        console.log("[info] Skipping unchanged test:", path.relative(workdir, safe));
+        continue;
+      }
+    } else {
+      fs.mkdirSync(path.dirname(safe), { recursive: true });
+    }
+
+    let newContent = t.content;
+    if (mode === "append_or_create" && existing) {
+      newContent = existing + "\n\n" + t.content;
+    } else if (mode === "replace") {
+      // use t.content as-is
+    }
+    const finalContent = withChecksum(newContent);
+    fs.writeFileSync(safe, finalContent, "utf8");
+    written.push(path.relative(workdir, safe));
+  }
+
+  // Commit & push tests (if any)
+  if (written.length) {
+    exec(`git -C "${workdir}" add ${written.map(w => `"${w}"`).join(" ")}`);
+    exec(`git -C "${workdir}" -c user.email="neuron[bot]@example.com" -c user.name="Neuron Bot" commit -m "chore(neuron): add/update generated tests"`);
+    // Push back to PR branch
+    exec(`git -C "${workdir}" push origin HEAD:${pr.head.ref}`);
+  }
+
+  // Post comments (cap to 3)
+  const maxComments = 3;
+  const toPost = (plan.comments || []).slice(0, maxComments).filter(c => {
+    const fp = `${c.path}:${c.line}:${c.title}`;
+    if (commentFingerprints.has(fp)) return false;
+    commentFingerprints.add(fp);
+    return true;
+  });
+
+  if (toPost.length) {
+    let body = `**Neuron — Business-context review**\n\n`;
+    for (const c of toPost) {
+      body += `- **${c.severity}** \`${c.path}:${c.line}\` — **${c.title}**\n  \n  ${c.body}\n\n`;
+    }
+    if (written.length) {
+      body += `**Generated/updated tests:**\n${written.map(w => `- \`${w}\``).join("\n")}\n`;
+    }
+    await postIssueComment(owner, repo, pr.number, body);
+  }
+
+  return { tests_written: written, comments_posted: toPost.length };
+}
+
+async function postSummary(owner, repo, pull_number, plan, applied) {
+  // Optional: add a compact summary comment (we already post combined above).
+  // Keeping this separate in case you later split inline vs summary.
+}
+
+async function postIssueComment(owner, repo, issue_number, body) {
+  try {
+    await octokit.issues.createComment({ owner, repo, issue_number, body });
+  } catch (e) {
+    console.error("[error] Failed to post PR comment:", e);
+  }
+}
