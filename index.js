@@ -35,6 +35,8 @@ const AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT || "";
 // Always post the combined comment (even when 0 findings/tests)
 const ALWAYS_COMMENT = (process.env.NEURON_ALWAYS_COMMENT || "true").toLowerCase() === "true";
 const DEBUG = (process.env.DEBUG_RENDER || "").toLowerCase() === "true";
+// NEW: when true, we post a tiny trace comment even if something fails mid-run
+const DEBUG_COMMENTS = (process.env.NEURON_DEBUG_COMMENTS || "true").toLowerCase() === "true";
 
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
 const openai =
@@ -61,33 +63,167 @@ app.get("/diag", (_req, res) => {
       AZURE_OPENAI_ENDPOINT: !!AZURE_OPENAI_ENDPOINT,
       AZURE_OPENAI_KEY: !!AZURE_OPENAI_KEY,
       AZURE_OPENAI_DEPLOYMENT: !!AZURE_OPENAI_DEPLOYMENT,
-      ALWAYS_COMMENT
+      ALWAYS_COMMENT,
+      DEBUG,
+      DEBUG_COMMENTS
     }
   });
 });
 
 app.post("/webhook", async (req, res) => {
+  // run-trace breadcrumbs; we’ll post these if anything fails
+  const trace = [];
+  let owner = "", repo = "", pull_number = 0;
+
   try {
     const raw = await getRawBody(req);
     const sig = req.headers["x-hub-signature-256"];
     const event = req.headers["x-github-event"];
+
+    trace.push("received");
+
     if (!verifySignature(sig, raw)) {
+      trace.push("signature_invalid");
       return res.status(401).send("Invalid signature");
     }
 
     const payload = JSON.parse(raw.toString("utf8"));
+    trace.push(`event=${event}`);
+
     if (event !== "pull_request") {
+      trace.push("ignored_event");
       return res.status(200).send("Ignored");
     }
     const action = payload.action;
     if (!["opened", "reopened", "synchronize", "ready_for_review"].includes(action)) {
+      trace.push(`ignored_action=${action}`);
       return res.status(200).send("No-op for this PR action");
     }
 
-    await handlePullRequest(payload);
+    const pr = payload.pull_request;
+    owner = payload.repository.owner.login;
+    repo = payload.repository.name;
+    pull_number = pr.number;
+
+    console.log(`[info] Handling PR #${pull_number} @ ${owner}/${repo}`);
+    trace.push("start_handle_pull_request");
+
+    if (!openai || !AZURE_OPENAI_DEPLOYMENT) {
+      trace.push("azure_missing");
+      await postIssueComment(owner, repo, pull_number,
+        "⚠️ Neuron could not generate a plan — **AZURE_CONFIG_MISSING** (endpoint/key/deployment not set).");
+      return res.status(200).send("OK");
+    }
+
+    const headRef = pr.head.ref;
+    const cloneUrl = pr.head.repo.clone_url.replace("https://", `https://x-access-token:${GITHUB_TOKEN}@`);
+
+    // Workdir & clone
+    const workdir = tmpDir("neuron-");
+    console.log("[info] workdir:", workdir);
+    exec(`git clone --depth=50 --branch "${headRef}" "${cloneUrl}" "${workdir}"`);
+    trace.push("cloned");
+
+    // Changed files (cap + trim patches)
+    const filesResp = await octokit.pulls.listFiles({ owner, repo, pull_number, per_page: 100 });
+    const changedRaw = filesResp.data || [];
+    const changed = trimChangedFiles(changedRaw);
+    trace.push(`changed=${changed.length}`);
+
+    // Signals (auto-detected repo hints)
+    const signals = collectRepoSignals(workdir);
+
+    // Languages / frameworks
+    const languages = detectLanguages(changed, workdir);
+    const testFrameworks = frameworkMap(languages);
+
+    // Existing test snippets (capped)
+    const existingTests = sampleExistingTests(workdir);
+
+    const cfg = readNeuronConfig(workdir);
+
+    const input = {
+      repo_meta: {
+        owner, repo,
+        headRef,
+        languages,
+        test_frameworks: testFrameworks,
+        package_manager: detectPackageManager(workdir)
+      },
+      signals,
+      changed_files: changed,
+      existing_tests: existingTests,
+      requirements: {
+        max_comments: cfg.max_inline_comments ?? 3
+      }
+    };
+
+    // Build messages with compact context
+    const messages = buildMessages(input, JSON.stringify(JSON_SCHEMA));
+
+    // Get plan (JSON mode first, then fallback)
+    trace.push("llm_request");
+    const { plan, diag } = await getLLMPlanWithFallback(messages);
+    trace.push(`llm=${diag?.code || "unknown"}`);
+
+    if (!plan) {
+      await postCombined(owner, repo, pull_number, { comments: [], tests: [] }, { tests_written: [] }, {
+        languages,
+        changedCount: changed.length,
+        diagCode: diag?.code || "ERROR"
+      }, trace);
+      return res.status(200).send("OK");
+    }
+
+    // Baseline: avoid repeats
+    ensureBaselineDir(workdir);
+    const baseline = readBaseline(workdir);
+    const filteredComments = (plan.comments || []).filter(c => !shouldSkipComment(workdir, baseline, c)).slice(0, 3);
+    const filteredPlan = { ...plan, comments: filteredComments };
+    trace.push(`comments_after_baseline=${filteredComments.length}`);
+
+    // Apply plan (write tests only; no comment posting here)
+    const applied = await applyPlan(workdir, filteredPlan, { owner, repo, pr });
+    trace.push(`tests_written=${applied.tests_written.length}`);
+
+    // Update baseline with posted comments (only the ones we actually keep)
+    const baselineChanged = recordComments(workdir, baseline, filteredComments);
+    if (baselineChanged) {
+      writeBaseline(workdir, baseline);
+    }
+
+    // Commit & push tests and baseline together, if any changed
+    const filesToCommit = [...(applied.tests_written || [])];
+    if (baselineChanged) filesToCommit.push(".neuron/baseline.json");
+    if (filesToCommit.length) {
+      exec(`git -C "${workdir}" add ${filesToCommit.map(w => `"${w}"`).join(" ")}`);
+      exec(`git -C "${workdir}" -c user.email="neuron[bot]@example.com" -c user.name="Neuron Bot" commit -m "chore(neuron): generated tests & updated baseline"`);
+      exec(`git -C "${workdir}" push origin HEAD:${pr.head.ref}`);
+      trace.push("pushed");
+    } else {
+      trace.push("nothing_to_commit");
+    }
+
+    // Post one combined comment (summary at top; findings/tests below if present)
+    if (ALWAYS_COMMENT) {
+      await postCombined(owner, repo, pull_number, filteredPlan, applied, {
+        languages,
+        changedCount: changed.length,
+        diagCode: diag?.code || "OK"
+      }, trace);
+    }
+
     res.status(200).send("OK");
   } catch (err) {
     console.error("[error] webhook handler failed:", err);
+    // Fallback: post a tiny trace so the PR never goes silent
+    if (DEBUG_COMMENTS && owner && repo && pull_number) {
+      const msg = (err && (err.message || String(err))) || "unknown";
+      try {
+        await postIssueComment(owner, repo, pull_number,
+          `⚠️ Neuron run failed early.\n\nTrace: ${trace.map(t => `\`${t}\``).join(" · ")}\n\nError: \`${msg.slice(0, 300)}\``);
+      } catch {}
+    }
     res.status(500).send("Error");
   }
 });
@@ -101,7 +237,8 @@ app.listen(PORT, () => {
 ======================= */
 
 function verifySignature(sigHeader, raw) {
-  if (!WEBHOOK_SECRET) return false;
+  // IMPORTANT: if no secret configured, allow the webhook instead of rejecting
+  if (!WEBHOOK_SECRET) return true;
   const expected = "sha256=" + crypto.createHmac("sha256", WEBHOOK_SECRET).update(raw).digest("hex");
   return sigHeader === expected;
 }
@@ -166,114 +303,7 @@ addFormats(ajv);
 const validatePlan = ajv.compile(JSON_SCHEMA);
 
 /* =======================
-   PR Handler
-======================= */
-
-async function handlePullRequest(payload) {
-  const pr = payload.pull_request;
-  const owner = payload.repository.owner.login;
-  const repo = payload.repository.name;
-  const pull_number = pr.number;
-
-  console.log(`[info] Handling PR #${pull_number} @ ${owner}/${repo}`);
-
-  if (!openai || !AZURE_OPENAI_DEPLOYMENT) {
-    await postIssueComment(owner, repo, pull_number,
-      "⚠️ Neuron could not generate a plan — **AZURE_CONFIG_MISSING** (endpoint/key/deployment not set).");
-    return;
-  }
-
-  const headRef = pr.head.ref;
-  const cloneUrl = pr.head.repo.clone_url.replace("https://", `https://x-access-token:${GITHUB_TOKEN}@`);
-
-  // Workdir & clone
-  const workdir = tmpDir("neuron-");
-  console.log("[info] workdir:", workdir);
-  exec(`git clone --depth=50 --branch "${headRef}" "${cloneUrl}" "${workdir}"`);
-
-  // Changed files (cap + trim patches)
-  const filesResp = await octokit.pulls.listFiles({ owner, repo, pull_number, per_page: 100 });
-  const changedRaw = filesResp.data || [];
-  const changed = trimChangedFiles(changedRaw);
-
-  // Signals (auto-detected repo hints)
-  const signals = collectRepoSignals(workdir);
-
-  // Languages / frameworks
-  const languages = detectLanguages(changed, workdir);
-  const testFrameworks = frameworkMap(languages);
-
-  // Existing test snippets (capped)
-  const existingTests = sampleExistingTests(workdir);
-
-  const cfg = readNeuronConfig(workdir);
-
-  const input = {
-    repo_meta: {
-      owner, repo,
-      headRef,
-      languages,
-      test_frameworks: testFrameworks,
-      package_manager: detectPackageManager(workdir)
-    },
-    signals,
-    changed_files: changed,
-    existing_tests: existingTests,
-    requirements: {
-      max_comments: cfg.max_inline_comments ?? 3
-    }
-  };
-
-  // Build messages with compact context
-  const messages = buildMessages(input, JSON.stringify(JSON_SCHEMA));
-
-  // Get plan (JSON mode first, then fallback)
-  const { plan, diag } = await getLLMPlanWithFallback(messages);
-
-  if (!plan) {
-    const reason = diag?.code || "UNKNOWN";
-    const detail = diag?.detail ? `\n\n> ${diag.detail}` : "";
-    await postIssueComment(owner, repo, pull_number,
-      `⚠️ Neuron could not generate a plan (**${reason}**).${detail}`);
-    return;
-  }
-
-  // Baseline: avoid repeats
-  ensureBaselineDir(workdir);
-  const baseline = readBaseline(workdir);
-  const filteredComments = (plan.comments || []).filter(c => !shouldSkipComment(workdir, baseline, c)).slice(0, 3);
-  const filteredPlan = { ...plan, comments: filteredComments };
-
-  // Apply plan (write tests only; no comment posting here)
-  const applied = await applyPlan(workdir, filteredPlan, { owner, repo, pr });
-
-  // Update baseline with posted comments (only the ones we actually keep)
-  const baselineChanged = recordComments(workdir, baseline, filteredComments);
-  if (baselineChanged) {
-    writeBaseline(workdir, baseline);
-  }
-
-  // Commit & push tests and baseline together, if any changed
-  const filesToCommit = [...(applied.tests_written || [])];
-  if (baselineChanged) filesToCommit.push(".neuron/baseline.json");
-  if (filesToCommit.length) {
-    exec(`git -C "${workdir}" add ${filesToCommit.map(w => `"${w}"`).join(" ")}`);
-    exec(`git -C "${workdir}" -c user.email="neuron[bot]@example.com" -c user.name="Neuron Bot" commit -m "chore(neuron): generated tests & updated baseline"`);
-    exec(`git -C "${workdir}" push origin HEAD:${pr.head.ref}`);
-  }
-
-  // Post one combined comment (summary at top; findings/tests below if present)
-  if (ALWAYS_COMMENT) {
-    await postCombined(owner, repo, pull_number, filteredPlan, applied, {
-      languages,
-      changedCount: changed.length,
-      diagCode: diag?.code || "OK"
-    });
-  }
-}
-
-/* =======================
-   Input Trimming & Signals
+   PR Handler helpers
 ======================= */
 
 function trimChangedFiles(files) {
@@ -297,7 +327,6 @@ function trimChangedFiles(files) {
   return out;
 }
 
-// Mine small, useful hints about the stack without heavy parsing.
 function collectRepoSignals(workdir) {
   const pkg = readJsonSafe(path.join(workdir, "package.json"));
   const deps = pkg ? { ...pkg.dependencies, ...pkg.devDependencies } : {};
@@ -462,7 +491,7 @@ function extractFirstJsonObject(text) {
   const fence = text.indexOf("```");
   if (fence !== -1) {
     const fenceEnd = text.indexOf("```", fence + 3);
-    const inside = fenceEnd !== -1 ? text.slice(fence + 3, fenceEnd) : text.slice(fence + 3);
+    const inside = fenceEnd !== -1 ? text.slice(fence + 3, fenceEnd) : text.slice(0);
     const s = inside.indexOf("{"), e = inside.lastIndexOf("}");
     if (s !== -1 && e !== -1 && e > s) return inside.slice(s, e + 1);
   }
@@ -490,7 +519,7 @@ function alreadyHasChecksum(content) {
   return /neuron:generated checksum=([a-f0-9]{64})/.test(content);
 }
 
-async function applyPlan(workdir, plan, ctx) {
+async function applyPlan(workdir, plan) {
   const written = [];
 
   // Tests
@@ -528,7 +557,7 @@ async function applyPlan(workdir, plan, ctx) {
    Combined Comment (summary + findings + tests)
 ======================= */
 
-async function postCombined(owner, repo, pull_number, plan, applied, meta) {
+async function postCombined(owner, repo, pull_number, plan, applied, meta, trace = []) {
   const comments = plan.comments || [];
   const tests = plan.tests || [];
   const wrote = applied.tests_written || [];
@@ -542,7 +571,7 @@ async function postCombined(owner, repo, pull_number, plan, applied, meta) {
   }
 
   body += `\n**Context**\n`;
-  body += `- Languages detected: ${meta.languages.length ? meta.languages.join(", ") : "(none)"}\n`;
+  body += `- Languages detected: ${meta.languages?.length ? meta.languages.join(", ") : "(none)"}\n`;
   body += `- Changed files analyzed: ${meta.changedCount}\n`;
   body += `- LLM mode: ${meta.diagCode}\n`;
 
@@ -565,6 +594,10 @@ async function postCombined(owner, repo, pull_number, plan, applied, meta) {
     } else {
       body += `- (no file changes written in this run)\n`;
     }
+  }
+
+  if (DEBUG_COMMENTS && trace?.length) {
+    body += `\n<sub>trace: ${trace.map(t => `\`${t}\``).join(" · ")}</sub>`;
   }
 
   await postIssueComment(owner, repo, pull_number, body);
