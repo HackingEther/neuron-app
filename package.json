@@ -1,21 +1,21 @@
 {
   "name": "neuron-app",
-  "version": "1.0.0",
-  "description": "",
+  "version": "1.1.0",
+  "description": "Neuron webhook — LLM-only reviewer/test generator",
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node index.js"
   },
-  "keywords": [],
-  "author": "",
   "license": "ISC",
   "dependencies": {
     "@azure/openai": "^1.0.0-beta.9",
     "@octokit/rest": "^22.0.0",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
     "dotenv": "^17.2.2",
     "express": "^5.1.0",
+    "js-yaml": "^4.1.0",
     "raw-body": "^3.0.1"
   }
 }
