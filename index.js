@@ -105,7 +105,7 @@ app.post("/webhook", async (req, res) => {
     repo = payload.repository.name;
     pull_number = pr.number;
 
-    // IMPORTANT: we will commit to the PR HEAD repo/branch
+    // IMPORTANT: commit to PR HEAD repo/branch
     const headOwner = pr.head.repo.owner.login;
     const headRepo = pr.head.repo.name;
     const headRef = pr.head.ref;
@@ -120,7 +120,7 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("OK");
     }
 
-    // Workdir & clone (we still clone to read/write files locally)
+    // Workdir & clone (local FS is easiest for analysis)
     const cloneUrl = pr.head.repo.clone_url.replace("https://", `https://x-access-token:${GITHUB_TOKEN}@`);
     const workdir = tmpDir("neuron-");
     console.log("[info] workdir:", workdir);
@@ -174,7 +174,7 @@ app.post("/webhook", async (req, res) => {
         languages,
         changedCount: changed.length,
         diagCode: diag?.code || "ERROR"
-      }, trace);
+      }, trace, { failedSnippets: [] });
       return res.status(200).send("OK");
     }
 
@@ -199,31 +199,38 @@ app.post("/webhook", async (req, res) => {
     const filesToCommit = [...(applied.tests_written || [])];
     if (baselineChanged) filesToCommit.push(".neuron/baseline.json");
 
+    let commitResult = { written: [], failed: [] };
     if (filesToCommit.length) {
-      for (const rel of filesToCommit) {
+      const params = filesToCommit.map(rel => {
         const abs = path.join(workdir, rel);
         const content = fs.readFileSync(abs, "utf8");
-        await upsertFileViaAPI({
+        return {
           owner: headOwner,
           repo: headRepo,
           branch: headRef,
           filepath: rel.replace(/\\/g, "/"),
           message: "chore(neuron): generated tests & updated baseline",
           content
-        });
-      }
-      trace.push("committed_via_api");
+        };
+      });
+      commitResult = await tryCommitFilesViaAPI(params);
+      trace.push(`committed_via_api=${commitResult.written.length},failed=${commitResult.failed.length}`);
     } else {
       trace.push("nothing_to_commit");
     }
 
     // Post one combined comment (summary at top; findings/tests below if present)
     if (ALWAYS_COMMENT) {
-      await postCombined(owner, repo, pull_number, filteredPlan, applied, {
-        languages,
-        changedCount: changed.length,
-        diagCode: diag?.code || "OK"
-      }, trace);
+      await postCombined(
+        owner,
+        repo,
+        pull_number,
+        filteredPlan,
+        applied,
+        { languages, changedCount: changed.length, diagCode: diag?.code || "OK" },
+        trace,
+        { failedSnippets: commitResult.failed }
+      );
     }
 
     res.status(200).send("OK");
@@ -567,7 +574,7 @@ async function applyPlan(workdir, plan) {
 }
 
 /* =======================
-   GitHub Contents API commit helper
+   GitHub Contents API commit + graceful fallback
 ======================= */
 
 async function upsertFileViaAPI({ owner, repo, branch, filepath, message, content }) {
@@ -577,7 +584,7 @@ async function upsertFileViaAPI({ owner, repo, branch, filepath, message, conten
     const { data } = await octokit.repos.getContent({ owner, repo, path: filepath, ref: branch });
     if (!Array.isArray(data) && data.sha) sha = data.sha;
   } catch (e) {
-    if (e.status !== 404) throw e;
+    if (e.status !== 404) throw e; // 404 = new file (fine)
   }
   await octokit.repos.createOrUpdateFileContents({
     owner,
@@ -590,14 +597,31 @@ async function upsertFileViaAPI({ owner, repo, branch, filepath, message, conten
   });
 }
 
+// Try to commit many files; collect failures with content for fallback display
+async function tryCommitFilesViaAPI(items) {
+  const written = [];
+  const failed = [];
+  for (const it of items) {
+    try {
+      await upsertFileViaAPI(it);
+      written.push(it.filepath);
+    } catch (e) {
+      const reason = (e && (e.status || e.message || String(e))) || "unknown";
+      failed.push({ path: it.filepath, reason: String(reason), content: it.content });
+    }
+  }
+  return { written, failed };
+}
+
 /* =======================
    Combined Comment (summary + findings + tests)
 ======================= */
 
-async function postCombined(owner, repo, pull_number, plan, applied, meta, trace = []) {
+async function postCombined(owner, repo, pull_number, plan, applied, meta, trace = [], extras = { failedSnippets: [] }) {
   const comments = plan.comments || [];
   const tests = plan.tests || [];
   const wrote = applied.tests_written || [];
+  const failedSnippets = extras.failedSnippets || [];
 
   let body = `**Neuron — Summary**\n\n`;
   body += `- Findings suggested: **${comments.length}**\n`;
@@ -630,6 +654,17 @@ async function postCombined(owner, repo, pull_number, plan, applied, meta, trace
       body += wrote.map(w => `- \`${w}\``).join("\n") + "\n";
     } else {
       body += `- (no file changes written in this run)\n`;
+    }
+  }
+
+  if (failedSnippets.length) {
+    body += `\n> ⚠️ Neuron could not write files due to repository permissions (e.g., fork PR or token lacks \`contents: write\`).\n`;
+    body += `> Copy these into your branch to apply now, or grant write permissions and rerun.\n`;
+    for (const f of failedSnippets) {
+      body += `\n**${f.path}**\n`;
+      // Don’t trim; test files are usually small. If you want, slice here.
+      body += `\n\`\`\`\n${f.content}\n\`\`\`\n`;
+      if (f.reason) body += `<sub>commit blocked: ${f.reason}</sub>\n`;
     }
   }
 
