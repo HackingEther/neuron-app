@@ -32,9 +32,8 @@ const AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT || "";
 const AZURE_OPENAI_KEY = process.env.AZURE_OPENAI_KEY || "";
 const AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT || "";
 
-// Always post summary (even when 0 findings/tests)
+// Always post the combined comment (even when 0 findings/tests)
 const ALWAYS_COMMENT = (process.env.NEURON_ALWAYS_COMMENT || "true").toLowerCase() === "true";
-// Verbose server logs
 const DEBUG = (process.env.DEBUG_RENDER || "").toLowerCase() === "true";
 
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
@@ -217,7 +216,6 @@ async function handlePullRequest(payload) {
       test_frameworks: testFrameworks,
       package_manager: detectPackageManager(workdir)
     },
-    // "Rules-free": instead of business docs, we pass mined signals + the diff
     signals,
     changed_files: changed,
     existing_tests: existingTests,
@@ -229,7 +227,7 @@ async function handlePullRequest(payload) {
   // Build messages with compact context
   const messages = buildMessages(input, JSON.stringify(JSON_SCHEMA));
 
-  // Get plan (with JSON-mode first, then fallback-extract)
+  // Get plan (JSON mode first, then fallback)
   const { plan, diag } = await getLLMPlanWithFallback(messages);
 
   if (!plan) {
@@ -246,10 +244,10 @@ async function handlePullRequest(payload) {
   const filteredComments = (plan.comments || []).filter(c => !shouldSkipComment(workdir, baseline, c)).slice(0, 3);
   const filteredPlan = { ...plan, comments: filteredComments };
 
-  // Apply plan
+  // Apply plan (write tests only; no comment posting here)
   const applied = await applyPlan(workdir, filteredPlan, { owner, repo, pr });
 
-  // Update baseline with posted comments (only the ones we actually used)
+  // Update baseline with posted comments (only the ones we actually keep)
   const baselineChanged = recordComments(workdir, baseline, filteredComments);
   if (baselineChanged) {
     writeBaseline(workdir, baseline);
@@ -264,11 +262,10 @@ async function handlePullRequest(payload) {
     exec(`git -C "${workdir}" push origin HEAD:${pr.head.ref}`);
   }
 
-  // Post summary (always)
+  // Post one combined comment (summary at top; findings/tests below if present)
   if (ALWAYS_COMMENT) {
-    await postSummary(owner, repo, pull_number, filteredPlan, applied, {
+    await postCombined(owner, repo, pull_number, filteredPlan, applied, {
       languages,
-      signals: { ...signals, _trimmed: true },
       changedCount: changed.length,
       diagCode: diag?.code || "OK"
     });
@@ -300,17 +297,14 @@ function trimChangedFiles(files) {
   return out;
 }
 
-// Mine small, useful hints about the domain/stack without heavy parsing.
+// Mine small, useful hints about the stack without heavy parsing.
 function collectRepoSignals(workdir) {
   const pkg = readJsonSafe(path.join(workdir, "package.json"));
   const deps = pkg ? { ...pkg.dependencies, ...pkg.devDependencies } : {};
-  const has = (name) => !!deps?.[name];
-
   const depsList = Object.keys(deps || {}).slice(0, 40);
   const envExample = readFileIfExists(path.join(workdir, ".env")).slice(0, 2000);
   const readme = readFileIfExists(path.join(workdir, "README.md")).slice(0, 2000);
 
-  // Light route/controller/schema discovery (very shallow, just filenames)
   const routes = findFiles(workdir, ["pages", "routes", "api"], [".js", ".ts", ".tsx"]).slice(0, 30);
   const schema = findFiles(workdir, ["schema", "prisma", "migrations", "db"], [".sql", ".prisma", ".ts"]).slice(0, 30);
   const testNames = findFiles(workdir, ["__tests__", "tests", "src/test"], [".test.js", ".spec.js", ".test.ts", ".java", ".py"]).slice(0, 30);
@@ -318,13 +312,13 @@ function collectRepoSignals(workdir) {
   return {
     deps: depsList,
     stack_hints: {
-      react: has("react") || has("next"),
-      nextjs: has("next"),
-      express: has("express"),
-      stripe: has("stripe") || has("@stripe/stripe-js"),
-      prisma: has("@prisma/client"),
-      graphql: has("graphql") || has("@apollo/client") || has("@apollo/server"),
-      axios: has("axios")
+      react: !!deps["react"] || !!deps["next"],
+      nextjs: !!deps["next"],
+      express: !!deps["express"],
+      stripe: !!deps["stripe"] || !!deps["@stripe/stripe-js"],
+      prisma: !!deps["@prisma/client"],
+      graphql: !!deps["graphql"] || !!deps["@apollo/client"] || !!deps["@apollo/server"],
+      axios: !!deps["axios"]
     },
     env_snippet: envExample,
     readme_snippet: readme,
@@ -343,7 +337,6 @@ function findFiles(root, folders, exts) {
     for (const entry of list) {
       const p = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        // only descend into interesting folders or top-level
         if (depth === 0 || folders.some(f => p.includes(`/${f}`))) walk(p, depth + 1);
       } else {
         const lower = entry.name.toLowerCase();
@@ -422,7 +415,6 @@ function readNeuronConfig(workdir) {
 ======================= */
 
 async function getLLMPlanWithFallback(messages) {
-  // Try strict JSON mode
   try {
     const resp = await openai.getChatCompletions(AZURE_OPENAI_DEPLOYMENT, messages, {
       temperature: 0.2,
@@ -438,8 +430,6 @@ async function getLLMPlanWithFallback(messages) {
   } catch (err) {
     DEBUG && console.warn("[warn] JSON mode failed; falling back:", err?.message || err);
   }
-
-  // Fallback: ask for JSON but extract from free-form if needed
   try {
     const forced = [
       ...messages,
@@ -482,7 +472,7 @@ function extractFirstJsonObject(text) {
 }
 
 /* =======================
-   Plan Application
+   Plan Application (no comment posting here)
 ======================= */
 
 function ensureSafePath(root, rel, fallback) {
@@ -501,9 +491,7 @@ function alreadyHasChecksum(content) {
 }
 
 async function applyPlan(workdir, plan, ctx) {
-  const { owner, repo, pr } = ctx;
   const written = [];
-  const fpSet = new Set();
 
   // Tests
   for (const t of plan.tests || []) {
@@ -533,45 +521,51 @@ async function applyPlan(workdir, plan, ctx) {
     written.push(path.relative(workdir, target));
   }
 
-  // Comments (cap 3)
-  const toPost = (plan.comments || []).slice(0, 3).filter(c => {
-    const fp = `${c.path}:${c.line}:${c.title}`;
-    if (fpSet.has(fp)) return false;
-    fpSet.add(fp);
-    return true;
-  });
-
-  if (toPost.length) {
-    let body = `**Neuron — Business-context review**\n\n`;
-    for (const c of toPost) {
-      body += `- **${c.severity}** \`${c.path}:${c.line}\` — **${c.title}**\n\n  ${c.body}\n\n`;
-    }
-    if (written.length) {
-      body += `**Generated/updated tests:**\n${written.map(w => `- \`${w}\``).join("\n")}\n`;
-    }
-    await postIssueComment(owner, repo, pr.number, body);
-  }
-
-  return { tests_written: written, comments_posted: toPost.length };
+  return { tests_written: written, comments_posted: (plan.comments || []).length };
 }
 
-async function postSummary(owner, repo, pull_number, plan, applied, meta) {
-  const commentsCount = plan.comments?.length || 0;
-  const testsCount = plan.tests?.length || 0;
-  const wroteCount = applied.tests_written?.length || 0;
+/* =======================
+   Combined Comment (summary + findings + tests)
+======================= */
+
+async function postCombined(owner, repo, pull_number, plan, applied, meta) {
+  const comments = plan.comments || [];
+  const tests = plan.tests || [];
+  const wrote = applied.tests_written || [];
 
   let body = `**Neuron — Summary**\n\n`;
-  body += `- Findings suggested: **${commentsCount}**\n`;
-  body += `- Test artifacts suggested: **${testsCount}**\n`;
-  body += `- Test files written: **${wroteCount}**\n`;
-  if (applied.tests_written?.length) {
-    body += applied.tests_written.map(w => `  - \`${w}\``).join("\n") + "\n";
+  body += `- Findings suggested: **${comments.length}**\n`;
+  body += `- Test artifacts suggested: **${tests.length}**\n`;
+  body += `- Test files written: **${wrote.length}**\n`;
+  if (wrote.length) {
+    body += wrote.map(w => `  - \`${w}\``).join("\n") + "\n";
   }
 
   body += `\n**Context**\n`;
   body += `- Languages detected: ${meta.languages.length ? meta.languages.join(", ") : "(none)"}\n`;
   body += `- Changed files analyzed: ${meta.changedCount}\n`;
   body += `- LLM mode: ${meta.diagCode}\n`;
+
+  if (comments.length === 0 && tests.length === 0) {
+    body += `\n_No business-impact issues detected and no test cases proposed by the model._\n`;
+    body += `\n> Tip: add \`/business/rules.md\` or \`/business/checklists.yaml\` for stronger domain hints (optional).`;
+  }
+
+  if (comments.length) {
+    body += `\n---\n\n**Neuron — Business-context review**\n\n`;
+    for (const c of comments) {
+      body += `- **${c.severity}** \`${c.path}:${c.line}\` — **${c.title}**\n\n  ${c.body}\n\n`;
+    }
+  }
+
+  if (tests.length) {
+    body += `\n**Generated/updated tests:**\n`;
+    if (wrote.length) {
+      body += wrote.map(w => `- \`${w}\``).join("\n") + "\n";
+    } else {
+      body += `- (no file changes written in this run)\n`;
+    }
+  }
 
   await postIssueComment(owner, repo, pull_number, body);
 }
