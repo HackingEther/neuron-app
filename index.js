@@ -35,7 +35,7 @@ const AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT || "";
 // Always post the combined comment (even when 0 findings/tests)
 const ALWAYS_COMMENT = (process.env.NEURON_ALWAYS_COMMENT || "true").toLowerCase() === "true";
 const DEBUG = (process.env.DEBUG_RENDER || "").toLowerCase() === "true";
-// NEW: when true, we post a tiny trace comment even if something fails mid-run
+// When true, post a tiny trace comment even if something fails mid-run
 const DEBUG_COMMENTS = (process.env.NEURON_DEBUG_COMMENTS || "true").toLowerCase() === "true";
 
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
@@ -105,6 +105,11 @@ app.post("/webhook", async (req, res) => {
     repo = payload.repository.name;
     pull_number = pr.number;
 
+    // IMPORTANT: we will commit to the PR HEAD repo/branch
+    const headOwner = pr.head.repo.owner.login;
+    const headRepo = pr.head.repo.name;
+    const headRef = pr.head.ref;
+
     console.log(`[info] Handling PR #${pull_number} @ ${owner}/${repo}`);
     trace.push("start_handle_pull_request");
 
@@ -115,10 +120,8 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("OK");
     }
 
-    const headRef = pr.head.ref;
+    // Workdir & clone (we still clone to read/write files locally)
     const cloneUrl = pr.head.repo.clone_url.replace("https://", `https://x-access-token:${GITHUB_TOKEN}@`);
-
-    // Workdir & clone
     const workdir = tmpDir("neuron-");
     console.log("[info] workdir:", workdir);
     exec(`git clone --depth=50 --branch "${headRef}" "${cloneUrl}" "${workdir}"`);
@@ -183,7 +186,7 @@ app.post("/webhook", async (req, res) => {
     trace.push(`comments_after_baseline=${filteredComments.length}`);
 
     // Apply plan (write tests only; no comment posting here)
-    const applied = await applyPlan(workdir, filteredPlan, { owner, repo, pr });
+    const applied = await applyPlan(workdir, filteredPlan);
     trace.push(`tests_written=${applied.tests_written.length}`);
 
     // Update baseline with posted comments (only the ones we actually keep)
@@ -192,14 +195,24 @@ app.post("/webhook", async (req, res) => {
       writeBaseline(workdir, baseline);
     }
 
-    // Commit & push tests and baseline together, if any changed
+    // Collect files to commit via API (NOT git push)
     const filesToCommit = [...(applied.tests_written || [])];
     if (baselineChanged) filesToCommit.push(".neuron/baseline.json");
+
     if (filesToCommit.length) {
-      exec(`git -C "${workdir}" add ${filesToCommit.map(w => `"${w}"`).join(" ")}`);
-      exec(`git -C "${workdir}" -c user.email="neuron[bot]@example.com" -c user.name="Neuron Bot" commit -m "chore(neuron): generated tests & updated baseline"`);
-      exec(`git -C "${workdir}" push origin HEAD:${pr.head.ref}`);
-      trace.push("pushed");
+      for (const rel of filesToCommit) {
+        const abs = path.join(workdir, rel);
+        const content = fs.readFileSync(abs, "utf8");
+        await upsertFileViaAPI({
+          owner: headOwner,
+          repo: headRepo,
+          branch: headRef,
+          filepath: rel.replace(/\\/g, "/"),
+          message: "chore(neuron): generated tests & updated baseline",
+          content
+        });
+      }
+      trace.push("committed_via_api");
     } else {
       trace.push("nothing_to_commit");
     }
@@ -551,6 +564,30 @@ async function applyPlan(workdir, plan) {
   }
 
   return { tests_written: written, comments_posted: (plan.comments || []).length };
+}
+
+/* =======================
+   GitHub Contents API commit helper
+======================= */
+
+async function upsertFileViaAPI({ owner, repo, branch, filepath, message, content }) {
+  // get sha if exists
+  let sha;
+  try {
+    const { data } = await octokit.repos.getContent({ owner, repo, path: filepath, ref: branch });
+    if (!Array.isArray(data) && data.sha) sha = data.sha;
+  } catch (e) {
+    if (e.status !== 404) throw e;
+  }
+  await octokit.repos.createOrUpdateFileContents({
+    owner,
+    repo,
+    path: filepath,
+    message,
+    content: Buffer.from(content, "utf8").toString("base64"),
+    branch,
+    sha
+  });
 }
 
 /* =======================
