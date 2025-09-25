@@ -7,30 +7,26 @@ import { execSync } from "node:child_process";
 import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import Ajv from "ajv";
 import addFormats from "ajv-formats";
 import * as yaml from "js-yaml";
-
-// Azure OpenAI
 import { OpenAIClient, AzureKeyCredential } from "@azure/openai";
 
 dotenv.config();
 
+/* =======================
+   Config / Globals
+======================= */
+
 const PORT = process.env.PORT || 3000;
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";
 
 const AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT || "";
 const AZURE_OPENAI_KEY = process.env.AZURE_OPENAI_KEY || "";
 const AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT || "";
 
-if (!WEBHOOK_SECRET) {
-  console.warn("[warn] WEBHOOK_SECRET is not set");
-}
-if (!GITHUB_TOKEN) {
-  console.warn("[warn] GITHUB_TOKEN is not set; Git operations will likely fail");
-}
+const DEBUG = (process.env.DEBUG_RENDER || "").toLowerCase() === "true";
 
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
 const openai =
@@ -38,9 +34,30 @@ const openai =
     ? new OpenAIClient(AZURE_OPENAI_ENDPOINT, new AzureKeyCredential(AZURE_OPENAI_KEY))
     : null;
 
+/* =======================
+   Express Setup
+======================= */
+
 const app = express();
 
-// We need raw body for signature verification
+app.get("/", (_req, res) => {
+  res.send("Neuron webhook (LLM mode) running");
+});
+
+// Non-secret diagnostics to debug deploys without leaking keys
+app.get("/diag", (_req, res) => {
+  res.json({
+    ok: true,
+    env: {
+      WEBHOOK_SECRET: !!WEBHOOK_SECRET,
+      GITHUB_TOKEN: !!GITHUB_TOKEN,
+      AZURE_OPENAI_ENDPOINT: !!AZURE_OPENAI_ENDPOINT,
+      AZURE_OPENAI_KEY: !!AZURE_OPENAI_KEY,
+      AZURE_OPENAI_DEPLOYMENT: !!AZURE_OPENAI_DEPLOYMENT
+    }
+  });
+});
+
 app.post("/webhook", async (req, res) => {
   try {
     const raw = await getRawBody(req);
@@ -59,7 +76,6 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("No-op for this PR action");
     }
 
-    // Process PR
     await handlePullRequest(payload);
     res.status(200).send("OK");
   } catch (err) {
@@ -68,15 +84,13 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-app.get("/", (_req, res) => {
-  res.send("Neuron webhook (LLM mode) running");
-});
-
 app.listen(PORT, () => {
   console.log(`Neuron webhook listening on :${PORT}`);
 });
 
-/* ----------------------- helpers ------------------------ */
+/* =======================
+   Utilities
+======================= */
 
 function verifySignature(sigHeader, raw) {
   if (!WEBHOOK_SECRET) return false;
@@ -85,13 +99,22 @@ function verifySignature(sigHeader, raw) {
 }
 
 function tmpDir(prefix) {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  return base;
+  const p = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  return p;
 }
 
 function exec(cmd, opts = {}) {
-  return execSync(cmd, { stdio: "inherit", ...opts });
+  DEBUG && console.log("[exec]", cmd);
+  return execSync(cmd, { stdio: DEBUG ? "inherit" : "ignore", ...opts });
 }
+
+function readFileIfExists(p) {
+  try { return fs.readFileSync(p, "utf8"); } catch { return ""; }
+}
+
+/* =======================
+   JSON Schema for LLM Plan
+======================= */
 
 const JSON_SCHEMA = {
   type: "object",
@@ -134,6 +157,10 @@ const ajv = new Ajv({ allErrors: true, strict: false });
 addFormats(ajv);
 const validatePlan = ajv.compile(JSON_SCHEMA);
 
+/* =======================
+   PR Handler
+======================= */
+
 async function handlePullRequest(payload) {
   const pr = payload.pull_request;
   const owner = payload.repository.owner.login;
@@ -142,44 +169,42 @@ async function handlePullRequest(payload) {
 
   console.log(`[info] Handling PR #${pull_number} @ ${owner}/${repo}`);
 
+  // Early Azure check
+  if (!openai || !AZURE_OPENAI_DEPLOYMENT) {
+    await postIssueComment(owner, repo, pull_number,
+      "⚠️ Neuron could not generate a plan — **AZURE_CONFIG_MISSING** (endpoint/key/deployment not set).");
+    return;
+  }
+
   const headRef = pr.head.ref;
-  const headSha = pr.head.sha;
   const cloneUrl = pr.head.repo.clone_url.replace("https://", `https://x-access-token:${GITHUB_TOKEN}@`);
 
-  // Temp working dir
+  // Workdir & clone
   const workdir = tmpDir("neuron-");
   console.log("[info] workdir:", workdir);
-
-  // Clone PR head
   exec(`git clone --depth=50 --branch "${headRef}" "${cloneUrl}" "${workdir}"`);
 
-  // Collect changed files with patches
+  // Changed files (cap to 100, cap patch size)
   const filesResp = await octokit.pulls.listFiles({ owner, repo, pull_number, per_page: 100 });
-  const changed = filesResp.data.map(f => ({
-    path: f.filename,
-    patch: f.patch || "",
-    status: f.status,
-    additions: f.additions,
-    deletions: f.deletions,
-    changes: f.changes
-  }));
+  const changedRaw = filesResp.data || [];
+  const changed = trimChangedFiles(changedRaw);
 
-  // Gather business context from repo
+  // Business context
   const business = readBusinessContext(workdir);
 
-  // Detect languages/frameworks (very simple heuristic)
+  // Languages / frameworks
   const languages = detectLanguages(changed, workdir);
-  const testFrameworks = frameworkMap(languages, workdir);
+  const testFrameworks = frameworkMap(languages);
 
-  // Sample existing tests (snippets only, cap by bytes)
+  // Existing test snippets (capped)
   const existingTests = sampleExistingTests(workdir);
 
-  // Config (from repo if present)
   const cfg = readNeuronConfig(workdir);
 
   const input = {
     repo_meta: {
-      owner, repo, headRef, headSha,
+      owner, repo,
+      headRef,
       languages,
       test_frameworks: testFrameworks,
       package_manager: detectPackageManager(workdir)
@@ -197,19 +222,47 @@ async function handlePullRequest(payload) {
     }
   };
 
-  const plan = await getLLMPlan(input);
+  const { plan, diag } = await getLLMPlanWithFallback(input);
+
   if (!plan) {
-    await postIssueComment(owner, repo, pull_number, ":warning: Neuron could not generate a plan (LLM unavailable or invalid JSON).");
+    const reason = diag?.code || "UNKNOWN";
+    const detail = diag?.detail ? `\n\n> ${diag.detail}` : "";
+    await postIssueComment(owner, repo, pull_number,
+      `⚠️ Neuron could not generate a plan (**${reason}**).${detail}`);
     return;
   }
 
-  // Apply the plan: write tests, commit, push; post comments (capped)
+  // Apply plan
   const applied = await applyPlan(workdir, plan, { owner, repo, pr });
+
+  // Post business-context summary
   await postSummary(owner, repo, pull_number, plan, applied);
 }
 
-function readFileIfExists(p) {
-  try { return fs.readFileSync(p, "utf8"); } catch { return ""; }
+/* =======================
+   Input Trimming / Repo Introspection
+======================= */
+
+function trimChangedFiles(files) {
+  // Prevent token explosion by limiting patch size per file and total files
+  const MAX_FILES = 25;
+  const MAX_PATCH_CHARS_PER_FILE = 5000; // ~few screens per file
+  const out = [];
+  for (const f of files.slice(0, MAX_FILES)) {
+    let patch = f.patch || "";
+    if (patch.length > MAX_PATCH_CHARS_PER_FILE) {
+      patch = patch.slice(0, MAX_PATCH_CHARS_PER_FILE) + "\n@@ ...patch truncated by Neuron @@";
+    }
+    out.push({
+      path: f.filename,
+      patch,
+      status: f.status,
+      additions: f.additions,
+      deletions: f.deletions,
+      changes: f.changes
+    });
+  }
+  return out;
 }
 
 function readBusinessContext(workdir) {
@@ -220,10 +273,15 @@ function readBusinessContext(workdir) {
   try {
     if (fs.existsSync(checklistsPath)) {
       const doc = yaml.load(fs.readFileSync(checklistsPath, "utf8"));
-      checklists = JSON.stringify(doc).slice(0, 4000); // cap
+      checklists = JSON.stringify(doc);
+      if (checklists.length > 4000) checklists = checklists.slice(0, 4000);
     }
   } catch {}
-  return { rules: rules.slice(0, 8000), userStories: userStories.slice(0, 8000), checklists };
+  return {
+    rules: rules.slice(0, 8000),
+    userStories: userStories.slice(0, 8000),
+    checklists
+  };
 }
 
 function detectLanguages(changed, workdir) {
@@ -234,14 +292,13 @@ function detectLanguages(changed, workdir) {
     else if (f.path.endsWith(".java")) set.add("java");
     else if (f.path.endsWith(".py")) set.add("python");
   }
-  // If no changed file hints, scan top-level package files
   if (fs.existsSync(path.join(workdir, "package.json"))) set.add("javascript");
   return Array.from(set);
 }
 
-function frameworkMap(languages, workdir) {
+function frameworkMap(langs) {
   const map = {};
-  for (const l of languages) {
+  for (const l of langs) {
     if (l === "typescript" || l === "javascript") map[l] = "jest";
     else if (l === "java") map[l] = "junit";
     else if (l === "python") map[l] = "pytest";
@@ -258,101 +315,142 @@ function detectPackageManager(workdir) {
 
 function sampleExistingTests(workdir) {
   const out = [];
-  function addIfExists(rel) {
+  function addDir(rel) {
     const abs = path.join(workdir, rel);
     if (fs.existsSync(abs) && fs.lstatSync(abs).isDirectory()) {
-      const files = fs.readdirSync(abs).filter(f => f.endsWith(".test.js") || f.endsWith(".spec.js") || f.endsWith(".test.ts") || f.endsWith(".java") || f.endsWith(".py"));
-      for (const f of files.slice(0, 10)) {
+      const files = fs.readdirSync(abs)
+        .filter(f => f.endsWith(".test.js") || f.endsWith(".spec.js") || f.endsWith(".test.ts") || f.endsWith(".java") || f.endsWith(".py"))
+        .slice(0, 8);
+      for (const f of files) {
         const p = path.join(abs, f);
         const txt = fs.readFileSync(p, "utf8");
-        out.push({ path: path.relative(workdir, p), snippet: txt.slice(0, 1200) });
+        out.push({ path: path.relative(workdir, p), snippet: txt.slice(0, 1000) });
       }
     }
   }
-  addIfExists("__tests__");
-  addIfExists("tests");
-  addIfExists("src/test/java");
+  addDir("__tests__");
+  addDir("tests");
+  addDir("src/test/java");
   return out.slice(0, 20);
 }
 
 function readNeuronConfig(workdir) {
   const p = path.join(workdir, "neuron.config.yml");
   if (!fs.existsSync(p)) return {};
-  try {
-    const doc = yaml.load(fs.readFileSync(p, "utf8"));
-    return doc?.neuron || {};
-  } catch {
-    return {};
-  }
+  try { return (yaml.load(fs.readFileSync(p, "utf8"))?.neuron) || {}; } catch { return {}; }
 }
 
-async function getLLMPlan(input) {
-  if (!openai) {
-    console.warn("[warn] Azure OpenAI not configured");
-    return null;
+/* =======================
+   Azure LLM w/ Fallback
+======================= */
+
+function extractFirstJsonObject(text) {
+  // Try to pull the first top-level JSON object from a free-form string.
+  // Handles code fences and prose.
+  const fence = text.indexOf("```");
+  if (fence !== -1) {
+    const fenceEnd = text.indexOf("```", fence + 3);
+    const inside = fenceEnd !== -1 ? text.slice(fence + 3, fenceEnd) : text.slice(fence + 3);
+    const braceStart = inside.indexOf("{");
+    const braceEnd = inside.lastIndexOf("}");
+    if (braceStart !== -1 && braceEnd !== -1 && braceEnd > braceStart) {
+      return inside.slice(braceStart, braceEnd + 1);
+    }
   }
-  const system = [
-    "You are Neuron, an expert software reviewer who enforces product/business rules.",
-    "Return ONLY valid JSON that matches the provided JSON schema.",
+  const s = text.indexOf("{");
+  const e = text.lastIndexOf("}");
+  if (s !== -1 && e !== -1 && e > s) {
+    return text.slice(s, e + 1);
+  }
+  return "";
+}
+
+async function getLLMPlanWithFallback(input) {
+  const SYSTEM = [
+    "You are Neuron, an expert reviewer who enforces product/business rules.",
+    "Return ONLY valid JSON matching the provided JSON schema.",
     "Prioritize business impact over style."
   ].join(" ");
-
   const schemaStr = JSON.stringify(JSON_SCHEMA);
 
-  const messages = [
-    { role: "system", content: system },
-    { role: "user", content: JSON.stringify({ ...input, json_schema: schemaStr }) }
-  ];
-
+  // Try strict JSON mode first
   try {
-    const result = await openai.getChatCompletions(AZURE_OPENAI_DEPLOYMENT, messages, {
+    const messages = [
+      { role: "system", content: SYSTEM },
+      { role: "user", content: JSON.stringify({ ...input, json_schema: schemaStr }) }
+    ];
+
+    const resp = await openai.getChatCompletions(AZURE_OPENAI_DEPLOYMENT, messages, {
       temperature: 0.2,
       maxTokens: 1200,
+      // Some Azure deployments support this; some don't. If unsupported, the SDK throws.
       responseFormat: { type: "json_object" }
     });
-    const content = result.choices?.[0]?.message?.content;
-    if (!content) return null;
+
+    const content = resp.choices?.[0]?.message?.content || "";
+    const plan = JSON.parse(content);
+    const valid = validatePlan(plan);
+    if (!valid) {
+      return { plan: null, diag: { code: "SCHEMA_INVALID", detail: JSON.stringify(validatePlan.errors).slice(0, 500) } };
+    }
+    return { plan, diag: { code: "OK_JSON_MODE" } };
+  } catch (err) {
+    // Fall through to non-JSON mode
+    DEBUG && console.warn("[warn] JSON mode failed; falling back:", err?.message || err);
+  }
+
+  // Retry WITHOUT responseFormat; then extract JSON from text
+  try {
+    const messages = [
+      { role: "system", content: SYSTEM },
+      { role: "user", content: JSON.stringify({ ...input, json_schema: JSON.stringify(JSON_SCHEMA) }) },
+      { role: "system", content: "Return ONLY a JSON object. Do not include any prose outside JSON." }
+    ];
+
+    const resp = await openai.getChatCompletions(AZURE_OPENAI_DEPLOYMENT, messages, {
+      temperature: 0.1,
+      maxTokens: 1400
+    });
+    const raw = resp.choices?.[0]?.message?.content || "";
+    const candidate = extractFirstJsonObject(raw);
+    if (!candidate) {
+      return { plan: null, diag: { code: "JSON_MISSING", detail: (raw || "").slice(0, 350) } };
+    }
     let plan;
     try {
-      plan = JSON.parse(content);
+      plan = JSON.parse(candidate);
     } catch (e) {
-      console.warn("[warn] LLM returned invalid JSON, retrying once with correction");
-      const retry = await openai.getChatCompletions(
-        AZURE_OPENAI_DEPLOYMENT,
-        [
-          { role: "system", content: system },
-          { role: "user", content: "Your previous response was not valid JSON. Return VALID JSON only that conforms to this schema: " + schemaStr },
-          { role: "user", content: JSON.stringify(input) }
-        ],
-        { temperature: 0.1, maxTokens: 1200, responseFormat: { type: "json_object" } }
-      );
-      const content2 = retry.choices?.[0]?.message?.content;
-      if (!content2) return null;
-      plan = JSON.parse(content2);
+      return { plan: null, diag: { code: "JSON_PARSE_FAIL", detail: candidate.slice(0, 350) } };
     }
     const valid = validatePlan(plan);
     if (!valid) {
-      console.error("[error] Plan schema invalid:", validatePlan.errors);
-      return null;
+      return { plan: null, diag: { code: "SCHEMA_INVALID", detail: JSON.stringify(validatePlan.errors).slice(0, 500) } };
     }
-    return plan;
-  } catch (err) {
-    console.error("[error] Azure OpenAI call failed:", err);
-    return null;
+    return { plan, diag: { code: "OK_FALLBACK" } };
+  } catch (err2) {
+    const msg = (err2 && (err2.message || String(err2))) || "unknown";
+    const code =
+      /quota|rate/i.test(msg) ? "AZURE_QUOTA" :
+      /unauthorized|401|forbidden|403/i.test(msg) ? "AZURE_AUTH" :
+      /model|deployment/i.test(msg) ? "AZURE_DEPLOYMENT" :
+      "MODEL_REJECT";
+    return { plan: null, diag: { code, detail: msg.slice(0, 400) } };
   }
 }
 
+/* =======================
+   Plan Application
+======================= */
+
 function ensureSafePath(root, rel, fallback) {
   const abs = path.resolve(root, rel);
-  if (!abs.startsWith(path.resolve(root))) {
-    return path.join(root, fallback);
-  }
+  if (!abs.startsWith(path.resolve(root))) return path.join(root, fallback);
   return abs;
 }
 
 function withChecksum(content) {
-  const cryptoHash = crypto.createHash("sha256").update(content, "utf8").digest("hex");
-  return `// neuron:generated checksum=${cryptoHash}\n${content}\n`;
+  const h = crypto.createHash("sha256").update(content, "utf8").digest("hex");
+  return `// neuron:generated checksum=${h}\n${content}\n`;
 }
 
 function alreadyHasChecksum(content) {
@@ -362,59 +460,55 @@ function alreadyHasChecksum(content) {
 async function applyPlan(workdir, plan, ctx) {
   const { owner, repo, pr } = ctx;
   const written = [];
-  const commentFingerprints = new Set();
+  const fpSet = new Set();
 
-  // Write tests
+  // Tests
   for (const t of plan.tests || []) {
     const defaultPath = t.language === "java"
       ? "src/test/java/NeuronGeneratedTest.java"
       : "__tests__/neuron.generated.test.js";
-    const safe = ensureSafePath(workdir, t.path, defaultPath);
+    const target = ensureSafePath(workdir, t.path, defaultPath);
     const mode = t.mode || "append_or_create";
 
     let existing = "";
-    if (fs.existsSync(safe)) {
-      existing = fs.readFileSync(safe, "utf8");
+    if (fs.existsSync(target)) {
+      existing = fs.readFileSync(target, "utf8");
       if (alreadyHasChecksum(existing) && existing.includes(t.content)) {
-        console.log("[info] Skipping unchanged test:", path.relative(workdir, safe));
+        console.log("[info] Skip unchanged test:", path.relative(workdir, target));
         continue;
       }
     } else {
-      fs.mkdirSync(path.dirname(safe), { recursive: true });
+      fs.mkdirSync(path.dirname(target), { recursive: true });
     }
 
-    let newContent = t.content;
+    let next = t.content;
     if (mode === "append_or_create" && existing) {
-      newContent = existing + "\n\n" + t.content;
-    } else if (mode === "replace") {
-      // use t.content as-is
+      next = existing + "\n\n" + t.content;
     }
-    const finalContent = withChecksum(newContent);
-    fs.writeFileSync(safe, finalContent, "utf8");
-    written.push(path.relative(workdir, safe));
+    const final = withChecksum(next);
+    fs.writeFileSync(target, final, "utf8");
+    written.push(path.relative(workdir, target));
   }
 
-  // Commit & push tests (if any)
+  // Commit & push
   if (written.length) {
     exec(`git -C "${workdir}" add ${written.map(w => `"${w}"`).join(" ")}`);
     exec(`git -C "${workdir}" -c user.email="neuron[bot]@example.com" -c user.name="Neuron Bot" commit -m "chore(neuron): add/update generated tests"`);
-    // Push back to PR branch
     exec(`git -C "${workdir}" push origin HEAD:${pr.head.ref}`);
   }
 
-  // Post comments (cap to 3)
-  const maxComments = 3;
-  const toPost = (plan.comments || []).slice(0, maxComments).filter(c => {
+  // Comments (cap 3)
+  const toPost = (plan.comments || []).slice(0, 3).filter(c => {
     const fp = `${c.path}:${c.line}:${c.title}`;
-    if (commentFingerprints.has(fp)) return false;
-    commentFingerprints.add(fp);
+    if (fpSet.has(fp)) return false;
+    fpSet.add(fp);
     return true;
   });
 
   if (toPost.length) {
     let body = `**Neuron — Business-context review**\n\n`;
     for (const c of toPost) {
-      body += `- **${c.severity}** \`${c.path}:${c.line}\` — **${c.title}**\n  \n  ${c.body}\n\n`;
+      body += `- **${c.severity}** \`${c.path}:${c.line}\` — **${c.title}**\n\n  ${c.body}\n\n`;
     }
     if (written.length) {
       body += `**Generated/updated tests:**\n${written.map(w => `- \`${w}\``).join("\n")}\n`;
@@ -426,8 +520,8 @@ async function applyPlan(workdir, plan, ctx) {
 }
 
 async function postSummary(owner, repo, pull_number, plan, applied) {
-  // Optional: add a compact summary comment (we already post combined above).
-  // Keeping this separate in case you later split inline vs summary.
+  // Optional secondary summary; we already posted a nice combined comment above.
+  // Keep empty for now; left here for future per-file inline threading, etc.
 }
 
 async function postIssueComment(owner, repo, issue_number, body) {
