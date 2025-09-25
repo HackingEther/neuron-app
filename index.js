@@ -341,12 +341,40 @@ function readNeuronConfig(workdir) {
 }
 
 /* =======================
-   Azure LLM w/ Fallback
+   Azure LLM w/ Fallback + Plan Shaping
 ======================= */
 
+// Few-shot example to force the shape (both keys present, arrays allowed to be empty)
+const FEW_SHOT_EXAMPLE = {
+  comments: [
+    {
+      path: "src/payments/PaymentSelector.tsx",
+      line: 128,
+      severity: "HIGH",
+      title: "Multi-payment regression risk",
+      body: "Business rule BR-12: default to last used method for users with >1 saved method. This change removes preferredPaymentId lookup; multi-method users will default to first item. Suggested fix: restore last-used lookup and fall back to explicit selection if null."
+    }
+  ],
+  tests: [
+    {
+      language: "javascript",
+      framework: "jest",
+      path: "__tests__/neuron.generated.test.js",
+      mode: "append_or_create",
+      content: "// neuron generated test\n test('selects last used payment when multiple exist', () => { /* ... */ });"
+    }
+  ]
+};
+
+function ensurePlanShape(plan) {
+  // Guardrail: if model forgets required top-level keys, add empty arrays
+  if (plan == null || typeof plan !== "object") return { comments: [], tests: [] };
+  if (!Array.isArray(plan.comments)) plan.comments = [];
+  if (!Array.isArray(plan.tests)) plan.tests = [];
+  return plan;
+}
+
 function extractFirstJsonObject(text) {
-  // Try to pull the first top-level JSON object from a free-form string.
-  // Handles code fences and prose.
   const fence = text.indexOf("```");
   if (fence !== -1) {
     const fenceEnd = text.indexOf("```", fence + 3);
@@ -369,7 +397,8 @@ async function getLLMPlanWithFallback(input) {
   const SYSTEM = [
     "You are Neuron, an expert reviewer who enforces product/business rules.",
     "Return ONLY valid JSON matching the provided JSON schema.",
-    "Prioritize business impact over style."
+    "Include BOTH top-level keys: comments (array) and tests (array).",
+    "If you have nothing to say for one section, return an empty array for that section."
   ].join(" ");
   const schemaStr = JSON.stringify(JSON_SCHEMA);
 
@@ -377,34 +406,55 @@ async function getLLMPlanWithFallback(input) {
   try {
     const messages = [
       { role: "system", content: SYSTEM },
-      { role: "user", content: JSON.stringify({ ...input, json_schema: schemaStr }) }
+      {
+        role: "user",
+        content: JSON.stringify({
+          ...input,
+          json_schema: schemaStr,
+          example: FEW_SHOT_EXAMPLE
+        })
+      }
     ];
 
     const resp = await openai.getChatCompletions(AZURE_OPENAI_DEPLOYMENT, messages, {
       temperature: 0.2,
       maxTokens: 1200,
-      // Some Azure deployments support this; some don't. If unsupported, the SDK throws.
       responseFormat: { type: "json_object" }
     });
 
     const content = resp.choices?.[0]?.message?.content || "";
-    const plan = JSON.parse(content);
+    let plan = JSON.parse(content);
+    plan = ensurePlanShape(plan);
+
     const valid = validatePlan(plan);
     if (!valid) {
-      return { plan: null, diag: { code: "SCHEMA_INVALID", detail: JSON.stringify(validatePlan.errors).slice(0, 500) } };
+      // One retry with explicit correction request
+      const retry = await openai.getChatCompletions(
+        AZURE_OPENAI_DEPLOYMENT,
+        [
+          { role: "system", content: SYSTEM },
+          { role: "user", content: "Your last output did not satisfy the schema. Produce ONLY a JSON object with keys comments:[] and tests:[] (arrays may be empty)." },
+          { role: "user", content: JSON.stringify({ ...input, json_schema: schemaStr, example: FEW_SHOT_EXAMPLE }) }
+        ],
+        { temperature: 0.1, maxTokens: 1200, responseFormat: { type: "json_object" } }
+      );
+      const content2 = retry.choices?.[0]?.message?.content || "";
+      plan = ensurePlanShape(JSON.parse(content2));
+      if (!validatePlan(plan)) {
+        return { plan: null, diag: { code: "SCHEMA_INVALID", detail: JSON.stringify(validatePlan.errors).slice(0, 500) } };
+      }
     }
     return { plan, diag: { code: "OK_JSON_MODE" } };
   } catch (err) {
-    // Fall through to non-JSON mode
     DEBUG && console.warn("[warn] JSON mode failed; falling back:", err?.message || err);
   }
 
-  // Retry WITHOUT responseFormat; then extract JSON from text
+  // Retry WITHOUT JSON mode; then extract JSON from text
   try {
     const messages = [
       { role: "system", content: SYSTEM },
-      { role: "user", content: JSON.stringify({ ...input, json_schema: JSON.stringify(JSON_SCHEMA) }) },
-      { role: "system", content: "Return ONLY a JSON object. Do not include any prose outside JSON." }
+      { role: "user", content: JSON.stringify({ ...input, json_schema: JSON.stringify(JSON_SCHEMA), example: FEW_SHOT_EXAMPLE }) },
+      { role: "system", content: "Return ONLY a JSON object with keys comments (array) and tests (array). Do not include any prose outside JSON." }
     ];
 
     const resp = await openai.getChatCompletions(AZURE_OPENAI_DEPLOYMENT, messages, {
@@ -416,12 +466,7 @@ async function getLLMPlanWithFallback(input) {
     if (!candidate) {
       return { plan: null, diag: { code: "JSON_MISSING", detail: (raw || "").slice(0, 350) } };
     }
-    let plan;
-    try {
-      plan = JSON.parse(candidate);
-    } catch (e) {
-      return { plan: null, diag: { code: "JSON_PARSE_FAIL", detail: candidate.slice(0, 350) } };
-    }
+    let plan = ensurePlanShape(JSON.parse(candidate));
     const valid = validatePlan(plan);
     if (!valid) {
       return { plan: null, diag: { code: "SCHEMA_INVALID", detail: JSON.stringify(validatePlan.errors).slice(0, 500) } };
@@ -519,9 +564,8 @@ async function applyPlan(workdir, plan, ctx) {
   return { tests_written: written, comments_posted: toPost.length };
 }
 
-async function postSummary(owner, repo, pull_number, plan, applied) {
-  // Optional secondary summary; we already posted a nice combined comment above.
-  // Keep empty for now; left here for future per-file inline threading, etc.
+async function postSummary(_owner, _repo, _pull_number, _plan, _applied) {
+  // Optional secondary summary; kept empty for now.
 }
 
 async function postIssueComment(owner, repo, issue_number, body) {
