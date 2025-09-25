@@ -26,6 +26,9 @@ const AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT || "";
 const AZURE_OPENAI_KEY = process.env.AZURE_OPENAI_KEY || "";
 const AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT || "";
 
+// If set true, we ALWAYS post a summary comment (even when 0 findings/tests)
+const ALWAYS_COMMENT = (process.env.NEURON_ALWAYS_COMMENT || "true").toLowerCase() === "true";
+// Verbose server logs
 const DEBUG = (process.env.DEBUG_RENDER || "").toLowerCase() === "true";
 
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
@@ -53,7 +56,8 @@ app.get("/diag", (_req, res) => {
       GITHUB_TOKEN: !!GITHUB_TOKEN,
       AZURE_OPENAI_ENDPOINT: !!AZURE_OPENAI_ENDPOINT,
       AZURE_OPENAI_KEY: !!AZURE_OPENAI_KEY,
-      AZURE_OPENAI_DEPLOYMENT: !!AZURE_OPENAI_DEPLOYMENT
+      AZURE_OPENAI_DEPLOYMENT: !!AZURE_OPENAI_DEPLOYMENT,
+      ALWAYS_COMMENT
     }
   });
 });
@@ -235,8 +239,19 @@ async function handlePullRequest(payload) {
   // Apply plan
   const applied = await applyPlan(workdir, plan, { owner, repo, pr });
 
-  // Post business-context summary
-  await postSummary(owner, repo, pull_number, plan, applied);
+  // Post business-context summary (ALWAYS, unless explicitly disabled)
+  if (ALWAYS_COMMENT) {
+    await postSummary(owner, repo, pull_number, plan, applied, {
+      languages,
+      businessPresence: {
+        rules: !!business.rules,
+        userStories: !!business.userStories,
+        checklists: !!business.checklists
+      },
+      changedCount: changed.length,
+      diagCode: diag?.code || "OK"
+    });
+  }
 }
 
 /* =======================
@@ -542,7 +557,7 @@ async function applyPlan(workdir, plan, ctx) {
     exec(`git -C "${workdir}" push origin HEAD:${pr.head.ref}`);
   }
 
-  // Comments (cap 3)
+  // Comments (cap 3 for inline-style summary list)
   const toPost = (plan.comments || []).slice(0, 3).filter(c => {
     const fp = `${c.path}:${c.line}:${c.title}`;
     if (fpSet.has(fp)) return false;
@@ -550,6 +565,8 @@ async function applyPlan(workdir, plan, ctx) {
     return true;
   });
 
+  // Combined comment body (if there are any findings, we’ll list them here;
+  // otherwise postSummary() will still post an empty summary)
   if (toPost.length) {
     let body = `**Neuron — Business-context review**\n\n`;
     for (const c of toPost) {
@@ -564,8 +581,34 @@ async function applyPlan(workdir, plan, ctx) {
   return { tests_written: written, comments_posted: toPost.length };
 }
 
-async function postSummary(_owner, _repo, _pull_number, _plan, _applied) {
-  // Optional secondary summary; kept empty for now.
+async function postSummary(owner, repo, pull_number, plan, applied, meta) {
+  // ALWAYS post a summary (unless env disables). This prevents "silence".
+  const commentsCount = plan.comments?.length || 0;
+  const testsCount = plan.tests?.length || 0;
+  const wroteCount = applied.tests_written?.length || 0;
+
+  let body = `**Neuron — Summary**\n\n`;
+  body += `- Findings suggested: **${commentsCount}**\n`;
+  body += `- Test artifacts suggested: **${testsCount}**\n`;
+  body += `- Test files written: **${wroteCount}**\n`;
+  if (applied.tests_written?.length) {
+    body += applied.tests_written.map(w => `  - \`${w}\``).join("\n") + "\n";
+  }
+
+  body += `\n**Context**\n`;
+  body += `- Languages seen: ${meta.languages.length ? meta.languages.join(", ") : "(none detected)"}\n`;
+  body += `- Business rules present: rules=${meta.businessPresence.rules}, user_stories=${meta.businessPresence.userStories}, checklists=${meta.businessPresence.checklists}\n`;
+  body += `- Changed files analyzed: ${meta.changedCount}\n`;
+  body += `- LLM mode: ${meta.diagCode}\n`;
+
+  if (commentsCount === 0 && testsCount === 0) {
+    body += `\n_No business-impact issues detected and no test cases proposed by the model._`;
+    if (!meta.businessPresence.rules && !meta.businessPresence.userStories && !meta.businessPresence.checklists) {
+      body += `\n> Tip: add \`/business/rules.md\` or \`/business/checklists.yaml\` to give Neuron stronger domain context.`;
+    }
+  }
+
+  await postIssueComment(owner, repo, pull_number, body);
 }
 
 async function postIssueComment(owner, repo, issue_number, body) {
